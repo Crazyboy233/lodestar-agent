@@ -1,0 +1,41 @@
+# ============================================================
+# 主 agent 配置（走你自己的 DeepSeek API）
+# ============================================================
+main_agent:
+  # DeepSeek 官方地址；若用中转/代理，改成对应的 OpenAI 兼容 base_url
+  base_url: "https://api.deepseek.com"
+  # 不要在这里写 key（本文件会进版本库）：
+  # 放到 config.local.yaml 的 main_agent.api_key（已 gitignore），或设环境变量 DEEPSEEK_API_KEY
+  api_key: ""
+  model: "deepseek-flash"        # 官方线路: deepseek-chat / deepseek-reasoner；若供应商提供 flash 型号，改成对应 id
+  temperature: 0.2
+  max_retries: 3                # 主 agent 模型请求失败时的重试次数，超限则终止流程
+  plan_retries: 2               # 拆解任务方案时，输出解析不成 JSON 的重试次数（与上面的请求重试分开计）
+
+# ============================================================
+# worker agent 配置（复用本机 codebuddy CLI 的无头模式）
+# ============================================================
+worker:
+  cli: "codebuddy"
+  model: ""                     # 留空 = 用 CLI 默认模型；也可填 deepseek-v4.1-flash 等
+  workdir: "./workspace"        # worker 的落地目录（它的 cwd）
+  timeout_seconds: 300          # 单个子任务超时
+  max_turns: 15                 # 单次执行最多多少轮，跑飞就提前收（透传 --max-turns）
+  max_retries: 2                # 执行失败（超时/429/CLI 报错）重试次数，超限则终止流程
+  allowed_tools: "Read,Write,Edit,Bash"
+  add_dirs: []                  # 需要额外授权的目录，如 [".."]
+  # 额外注入给 worker 的环境变量（一般不用；若要免登录用 token，取消注释）
+  # env:
+  #   CODEBUDDY_AUTH_TOKEN: "在这里填你的 CodeBuddy token"
+
+# ============================================================
+# 验收 agent 配置（独立模型、独立会话，同样走 codebuddy CLI）
+# ============================================================
+verifier:
+  cli: "codebuddy"
+  model: ""                     # 想换第三个模型就填这里，如 deepseek-v4.1-flash；留空用 CLI 默认
+  timeout_seconds: 180
+  allowed_tools: "Read,Write,Bash"  # 自己写 test 脚本需要 Write；被测目录只读，脚本写到 scratch_dir
+  scratch_dir: ".verify"        # 测试脚本目录（相对 workdir），避免污染 worker 产出
+  max_rounds: 3                 # 同一条子任务最多「执行 → 验收」几轮，防死循环
+  max_retries: 2                # 验收 agent 自身请求失败重试次数，超限则终止流程

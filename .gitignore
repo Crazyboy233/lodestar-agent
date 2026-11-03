@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+config.local.yaml
+.workbuddy/
+.pytest_cache/
+.DS_Store
+
+# worker 的产出不进版本库（保留目录本身）
+workspace/*
+!workspace/.gitkeep
+.verify/
+
+logs/
+
+# LangGraph checkpoint（每次运行的 state，可 --resume 续跑）
+checkpoints.sqlite
+checkpoints.sqlite-wal
+checkpoints.sqlite-shm
