@@ -18,3 +18,11 @@ logs/
 checkpoints.sqlite
 checkpoints.sqlite-wal
 checkpoints.sqlite-shm
+
+# 左侧导航的运行历史（线程 / 产出目录 / 状态），属于本机运行时数据
+history.json
+history.json.tmp
+
+# 前端依赖：构建产物留在 lodestar_agent/static/（体积不大，直接跑得到）
+frontend/node_modules/
+frontend/dist/

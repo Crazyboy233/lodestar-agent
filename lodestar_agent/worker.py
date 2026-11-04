@@ -10,24 +10,33 @@
 from __future__ import annotations
 
 import json
+import atexit
 import os
 import re
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 WORKER_PROMPT = """你是 worker agent，负责独立完成下面这一个子任务。
 
 工作目录：{cwd}
 子任务：{task}
-{feedback}
+{feedback}{guidance}
 要求：
 1. 直接在磁盘上动手（写文件 / 改文件 / 跑命令），不要只描述做法。
 2. 只做这一个子任务，不要顺手重构或扩展别的文件。
 3. 完成后用中文汇报 1~3 行：动了哪些文件、怎么验证的、结果如何。
+"""
+
+# 用户在 worker 跑动过程中投递的引导：不打断当前这一轮，等下一次调用才拼进来。
+GUIDANCE_BLOCK = """
+用户在你执行过程中插入的引导（优先级高于上面的一般要求，但仍不要越出本子任务范围）：
+{notes}
 """
 
 VERIFIER_PROMPT = """你是独立的验收 agent，负责自己写测试脚本并执行，判定子任务是否达标。
@@ -72,10 +81,18 @@ _KEEP_ENV_PREFIX = ("LC_",)
 
 
 def _child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    # Windows 环境变量大小写不敏感，SystemRoot / Path 这类常常不是全大写；
+    # 统一按大写比较并归一化 key，避免 node 子进程丢掉 SYSTEMROOT / PATHEXT。
+    win = os.name == "nt"
+
+    def keep(key: str) -> bool:
+        probe = key.upper() if win else key
+        return probe in _KEEP_ENV or probe.startswith(_KEEP_ENV_PREFIX)
+
     env = {
-        key: value
+        (key.upper() if win else key): value
         for key, value in os.environ.items()
-        if key in _KEEP_ENV or key.startswith(_KEEP_ENV_PREFIX)
+        if keep(key)
     }
     # 单发 -p 模式不支持后台任务，关掉避免 worker 起后台命令时报错
     env["CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
@@ -91,6 +108,7 @@ class CliResult:
     duration: float
     session_id: str | None = None
     error: str | None = None
+    aborted: bool = False  # True 表示因为用户请求退出而被主动终止，不是失败
 
 
 @dataclass
@@ -101,6 +119,7 @@ class Verdict:
     raw: str = ""
     duration: float = 0.0
     error: str | None = None  # 非空表示验收 agent 自身的请求失败（不是"验收不通过"）
+    aborted: bool = False  # True 表示验收过程被用户请求退出打断
 
 
 def check_cli(cli: str) -> str:
@@ -236,27 +255,122 @@ def _diagnose(raw: str) -> str:
     return _clip(raw)
 
 
-def _terminate_tree(proc: subprocess.Popen, grace: float = 3.0) -> None:
-    """给整个子进程组发信号，避免 CLI 自己起的子进程变成孤儿。"""
-    if proc.poll() is not None:
+def _terminate_windows(proc: subprocess.Popen, grace: float = 3.0) -> None:
+    """Windows 没有进程组信号，用 taskkill /T /F 把 CLI 和它拉起的 node 一起收掉。"""
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+            timeout=grace,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+    except OSError:
+        pass
+    if proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def _terminate_tree(proc: subprocess.Popen, grace: float = 3.0, first: int = signal.SIGTERM) -> None:
+    """给整个子进程组发信号，确保 CLI 和它 fork 的 node 子进程一起被回收。
+
+    三条都是从实际卡死里换来的：
+
+    1. pgid 直接用 `proc.pid`。`start_new_session=True` 保证它是新会话的 leader，
+       比自己 `getpgid` 可靠 —— 进程刚退出时 getpgid 会抛 ProcessLookupError，
+       那条 except 分支只 kill 主进程，组里还活着的孙进程就被漏掉了。
+    2. SIGTERM 之后**无论主进程退没退**，都再对整组补一次 SIGKILL。主进程死了
+       不代表孙进程死了，而孙进程会攥着 stdout pipe 不放。
+    3. 组已经空了（ProcessLookupError）才是真的收干净了，直接返回。
+    """
+    if os.name == "nt":
+        _terminate_windows(proc, grace)
         return
+
+    pgid = proc.pid
     if not hasattr(os, "killpg"):
-        proc.kill()
+        if proc.poll() is None:
+            proc.kill()
         return
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        proc.kill()
+        os.killpg(pgid, first)
+    except ProcessLookupError:
+        return  # 组里一个进程都没有了
+    except PermissionError:
+        if proc.poll() is None:
+            proc.kill()
         return
     try:
         proc.wait(timeout=grace)
-        return
     except subprocess.TimeoutExpired:
         pass
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+def _drain_pipes(proc: subprocess.Popen, timeout: float = 5.0) -> tuple[str, str]:
+    """读掉子进程残留输出。
+
+    必须带超时：万一有孙进程没被回收、仍持有 stdout，`communicate()` 会一直等 EOF，
+    整个流程就卡在收尾这一步 —— 表现是「点了退出但进程不退」，非常难查。
+    """
+    try:
+        return proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "", ""
+
+
+# ── 在途 CLI 进程的兜底回收 ──────────────────────────────
+# 光靠 run_cli 的异常路径不够：进程被外部 SIGTERM、或某处抛了没接住的异常时，
+# CLI 和它 fork 的 node 子进程会变成孤儿 —— 那它手里的模型请求也就断不掉。
+_ACTIVE: "set[subprocess.Popen]" = set()
+_ACTIVE_LOCK = threading.Lock()
+
+
+def _track(proc: subprocess.Popen) -> None:
+    with _ACTIVE_LOCK:
+        _ACTIVE.add(proc)
+
+
+def _untrack(proc: subprocess.Popen) -> None:
+    with _ACTIVE_LOCK:
+        _ACTIVE.discard(proc)
+
+
+def terminate_all_cli() -> int:
+    """终止所有还在跑的 CLI 进程组，返回处理个数。
+
+    收尾和进程退出（atexit）都会调一次：杀掉进程组 = 关掉它持有的 HTTP 连接，
+    服务端那边才会停止生成，而不是一直算到 token 用完。
+    """
+    with _ACTIVE_LOCK:
+        procs = list(_ACTIVE)
+        _ACTIVE.clear()
+    killed = 0
+    for proc in procs:
+        if proc.poll() is None:
+            _terminate_tree(proc, grace=2.0)
+            killed += 1
+    return killed
+
+
+def _cli_argv(cli_path: str, args: list[str]) -> list[str]:
+    """Windows 的 npm 全局命令常是 .cmd shim，CreateProcess 不能直接执行，
+    要交给 cmd.exe；.exe 则原样执行。POSIX 原样执行。"""
+    if os.name == "nt" and cli_path.lower().endswith((".cmd", ".bat")):
+        comspec = os.environ.get("COMSPEC") or "cmd.exe"
+        return [comspec, "/c", cli_path, *args]
+    return [cli_path, *args]
 
 
 def run_cli(
@@ -270,51 +384,99 @@ def run_cli(
     timeout: float = 300.0,
     max_turns: int = 0,
     extra_env: dict[str, str] | None = None,
+    cancel: threading.Event | None = None,
+    drain_deadline: float | "Callable[[], float | None]" | None = None,
 ) -> CliResult:
+    """跑一次 CLI。
+
+    cancel / drain_deadline 是「边界退出」的接线：cancel 被置位**不会**打断已经发出去的
+    这一轮，它只说明「之后不许再开新的」；只有到了 drain_deadline 还没结束，才真的
+    SIGTERM → SIGKILL。这样当前节点的产出是完整的，不会留半成品。
+
+    drain_deadline 可以是常量，也可以是**回调**。必须支持回调：退出请求往往发生在
+    CLI 已经跑起来之后，进入这里时它还求不出来；传死值会导致强杀分支永远不触发，
+    表现就是「点了退出，进程一直不退」。
+    """
     cwd = Path(cwd).expanduser().resolve()
     cwd.mkdir(parents=True, exist_ok=True)
 
     cli_path = check_cli(cli)
-    cmd = [cli_path, "-p", prompt, "--output-format", "json", "-y"]
+    cli_args = ["-p", prompt, "--output-format", "json", "-y"]
     if allowed_tools:
-        cmd += ["--allowedTools", allowed_tools]
+        cli_args += ["--allowedTools", allowed_tools]
     if model:
-        cmd += ["--model", model]
+        cli_args += ["--model", model]
     if max_turns and max_turns > 0:
-        cmd += ["--max-turns", str(max_turns)]
+        cli_args += ["--max-turns", str(max_turns)]
     for d in add_dirs or []:
-        cmd += ["--add-dir", str(d)]
+        cli_args += ["--add-dir", str(d)]
+    cmd = _cli_argv(cli_path, cli_args)
 
     env = _child_env(extra_env)
 
     started = time.time()
-    # start_new_session：给 CLI 单独一个进程组，中断/超时时可以整组回收
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
+    # POSIX 用 start_new_session 给 CLI 单独一个进程组，中断/超时时整组回收；
+    # Windows 没有进程组信号，回收走 taskkill /T（见 _terminate_windows）。
+    popen_kwargs: dict = {
+        "cwd": str(cwd),
+        "env": env,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    forced = False
+    _track(proc)
+
+    def _deadline() -> float | None:
+        # 每次轮询都重新求值：退出请求可能在这次调用开始之后才发生
+        return drain_deadline() if callable(drain_deadline) else drain_deadline
+
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _terminate_tree(proc)
-        stdout, stderr = proc.communicate()
-        return CliResult(
-            ok=False,
-            output="",
-            duration=time.time() - started,
-            error=f"超时：超过 {timeout:.0f}s（已终止整个子进程组）",
-        )
+        # 轮询而不是一次阻塞到结束：这样才能在「已经等了太久」时兜底强杀。
+        # 注意 cancel 单独被置位不等于要中断 —— 边界退出的默认行为是把它跑完。
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                now = time.time()
+                limit = _deadline()
+                if cancel is not None and cancel.is_set() and limit is not None and now >= limit:
+                    forced = True
+                    _terminate_tree(proc, grace=3.0)
+                    stdout, stderr = _drain_pipes(proc)
+                    break
+                if now - started > timeout:
+                    _terminate_tree(proc)
+                    stdout, stderr = _drain_pipes(proc)
+                    return CliResult(
+                        ok=False,
+                        output="",
+                        duration=time.time() - started,
+                        error=f"超时：超过 {timeout:.0f}s（已终止整个子进程组）",
+                    )
     except KeyboardInterrupt:
         _terminate_tree(proc)
         raise
+    finally:
+        _untrack(proc)
 
     duration = time.time() - started
     raw = f"{stdout or ''}\n{stderr or ''}".strip()
+
+    if forced:
+        # 已经等过 drain_timeout 了，这是兜底路径，不是常规退出
+        return CliResult(
+            ok=False,
+            output=_clip(raw, 600),
+            duration=duration,
+            error="超过等待上限仍未结束，已强制终止（可用 ui.drain_timeout_seconds 放宽）",
+            aborted=True,
+        )
+
     data = _parse_json(stdout)
 
     # 未登录：CLI 把 "Authentication required." 打到 stderr，且退出码可能仍是 0
@@ -351,9 +513,14 @@ def run_worker(
     *,
     cwd: Path,
     feedback: str = "",
+    guidance: str = "",
     **kwargs,
 ) -> CliResult:
-    """worker agent：干活。feedback 非空时是上一轮验收打回的原因。"""
+    """worker agent：干活。
+
+    feedback 非空时是上一轮验收打回的原因；guidance 是用户在运行过程中插入的引导
+    （排队投递，到这里才拼进 prompt —— 所以不会打断已经在跑的那一轮）。
+    """
     extra = ""
     if feedback.strip():
         extra = (
@@ -361,7 +528,12 @@ def run_worker(
             f"{feedback.strip()}\n"
             "请针对这个问题修改，别重做无关部分。\n"
         )
-    prompt = WORKER_PROMPT.format(cwd=Path(cwd).expanduser().resolve(), task=task, feedback=extra)
+    guide = ""
+    if guidance.strip():
+        guide = GUIDANCE_BLOCK.format(notes=guidance.strip())
+    prompt = WORKER_PROMPT.format(
+        cwd=Path(cwd).expanduser().resolve(), task=task, feedback=extra, guidance=guide
+    )
     return run_cli(prompt, cwd=cwd, **kwargs)
 
 
@@ -403,6 +575,16 @@ def run_verifier(
         result = run_cli(prompt, cwd=scratch, add_dirs=extra_dirs, **kwargs)
         if result.ok:
             break
+        if result.aborted:
+            # 用户要求退出：不要把它当成"验收请求失败"去重试
+            return Verdict(
+                passed=False,
+                reason="",
+                fix="",
+                duration=result.duration,
+                error=result.error or "已按用户请求中止",
+                aborted=True,
+            )
         last_err = result.error or "未知错误"
         if attempt < max_retries:
             time.sleep(min(2 ** attempt, 8))
@@ -435,3 +617,8 @@ def run_verifier(
         raw=result.output,
         duration=result.duration,
     )
+
+
+# 进程退出（正常结束 / 未捕获异常）时兜底：不留活着的 CLI 子进程。
+# 被 SIGKILL 时无法执行，那种情况只能靠进程组本身被一起回收。
+atexit.register(terminate_all_cli)

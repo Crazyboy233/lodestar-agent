@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -13,9 +14,16 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from agent_demo.config import load_config  # noqa: E402
-from agent_demo.graph import AgentFailure, _parse_plan, build_graph  # noqa: E402
-from agent_demo.worker import CliResult, Verdict, _diagnose, _parse_json, run_worker  # noqa: E402
+from lodestar_agent.config import load_config  # noqa: E402
+from lodestar_agent.control import Control  # noqa: E402
+from lodestar_agent.graph import (  # noqa: E402
+    AgentFailure,
+    ModelAborted,
+    _invoke_interruptible,
+    _parse_plan,
+    build_graph,
+)
+from lodestar_agent.worker import CliResult, Verdict, _diagnose, _parse_json, run_worker  # noqa: E402
 
 
 class FakeLLM:
@@ -29,6 +37,10 @@ class FakeLLM:
         self.calls += 1
         reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
         return SimpleNamespace(content=reply)
+
+    def stream(self, messages):
+        # 真实链路走 stream（这样才能中途断开），桩也照着来，保证计数一致
+        yield self.invoke(messages)
 
 
 def _fake_worker(calls: list[str], ok: bool = True):
@@ -67,8 +79,8 @@ def test_verify_fail_then_pass_retries_worker() -> None:
         return Verdict(True, "通过", "", duration=0.0)
 
     plan = [{"task": "t1", "verify": "ls a.txt"}, {"task": "t2", "verify": "ls b.txt"}]
-    with patch("agent_demo.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
-        "agent_demo.graph.run_verifier", side_effect=fake_verifier
+    with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
+        "lodestar_agent.graph.run_verifier", side_effect=fake_verifier
     ):
         out = app.invoke(
             {"goal": "g", "plan": plan, "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -92,8 +104,8 @@ def test_retry_cap_stops_dead_loop() -> None:
         return Verdict(False, "永远不达标", "再改", duration=0.0)
 
     plan = [{"task": "t1", "verify": "ls a.txt"}, {"task": "t2", "verify": "ls b.txt"}]
-    with patch("agent_demo.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
-        "agent_demo.graph.run_verifier", side_effect=always_fail
+    with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
+        "lodestar_agent.graph.run_verifier", side_effect=always_fail
     ):
         out = app.invoke(
             {"goal": "g", "plan": plan, "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -118,7 +130,7 @@ def test_exec_failure_terminates_after_retries() -> None:
         return CliResult(ok=False, output="", duration=0.0, error="429 too many requests")
 
     plan = [{"task": "t1", "verify": ""}]
-    with patch("agent_demo.graph.run_worker", side_effect=failing_worker):
+    with patch("lodestar_agent.graph.run_worker", side_effect=failing_worker):
         try:
             app.invoke(
                 {"goal": "g", "plan": plan, "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -149,8 +161,8 @@ def test_plan_dynamic_replan() -> None:
         return Verdict(True, "通过", "", duration=0.0)
 
     plan = [{"task": "t1", "verify": "ls a.txt"}, {"task": "t2", "verify": "ls b.txt"}]
-    with patch("agent_demo.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
-        "agent_demo.graph.run_verifier", side_effect=always_pass
+    with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
+        "lodestar_agent.graph.run_verifier", side_effect=always_pass
     ):
         out = app.invoke(
             {"goal": "g", "plan": plan, "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -181,8 +193,8 @@ def test_plan_parse_retry() -> None:
     def always_pass(_t, _v, _o, **_kw):
         return Verdict(True, "通过", "", duration=0.0)
 
-    with patch("agent_demo.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
-        "agent_demo.graph.run_verifier", side_effect=always_pass
+    with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
+        "lodestar_agent.graph.run_verifier", side_effect=always_pass
     ):
         out = app.invoke(
             {"goal": "g", "plan": [], "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -214,8 +226,8 @@ def test_plan_parse_retry_exhausted_falls_back() -> None:
     def always_pass(_t, _v, _o, **_kw):
         return Verdict(True, "通过", "", duration=0.0)
 
-    with patch("agent_demo.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
-        "agent_demo.graph.run_verifier", side_effect=always_pass
+    with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
+        "lodestar_agent.graph.run_verifier", side_effect=always_pass
     ):
         out = app.invoke(
             {"goal": "把 a 改成 b", "plan": [], "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -255,8 +267,8 @@ def test_checkpoint_persists_and_resumes() -> None:
             return Verdict(True, "通过", "", duration=0.0)
 
         app = build_graph(cfg, llm=FakeLLM("汇总"), checkpointer=saver)
-        with patch("agent_demo.graph.run_worker", side_effect=interrupted_worker), patch(
-            "agent_demo.graph.run_verifier", side_effect=always_pass
+        with patch("lodestar_agent.graph.run_worker", side_effect=interrupted_worker), patch(
+            "lodestar_agent.graph.run_verifier", side_effect=always_pass
         ):
             try:
                 app.invoke(initial, run_config)
@@ -280,8 +292,8 @@ def test_checkpoint_persists_and_resumes() -> None:
             llm=FakeLLM(['{"remaining":[],"note":"收工"}', "最终答复"]),
             checkpointer=saver,
         )
-        with patch("agent_demo.graph.run_worker", side_effect=ok_worker), patch(
-            "agent_demo.graph.run_verifier", side_effect=always_pass
+        with patch("lodestar_agent.graph.run_worker", side_effect=ok_worker), patch(
+            "lodestar_agent.graph.run_verifier", side_effect=always_pass
         ):
             out = app2.invoke(None, run_config)
 
@@ -312,7 +324,7 @@ def test_resume_after_exec_failure_resets_attempts() -> None:
         def failing(_task, **_kw):
             return CliResult(ok=False, output="", duration=0.0, error="401 unauthorized")
 
-        with patch("agent_demo.graph.run_worker", side_effect=failing):
+        with patch("lodestar_agent.graph.run_worker", side_effect=failing):
             try:
                 app.invoke(
                     {"goal": "g", "plan": [{"task": "t1", "verify": ""}], "current": None,
@@ -330,7 +342,7 @@ def test_resume_after_exec_failure_resets_attempts() -> None:
         # 模拟 __main__ 的 --resume：重置计数后应能重新执行同一条任务
         app.update_state(run_config, {"attempts": 0, "last_error": ""}, as_node="verify")
         calls: list[str] = []
-        with patch("agent_demo.graph.run_worker", side_effect=_fake_worker(calls)):
+        with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(calls)):
             out = app.invoke(None, run_config)
 
         assert calls == ["t1"], calls
@@ -364,8 +376,733 @@ def test_diagnose_never_dumps_transcript() -> None:
     print("ok  diagnose_never_dumps_transcript")
 
 
+def test_guidance_reaches_worker_once() -> None:
+    """投递给 worker 的引导只在下一次调用生效，且消费后不再重复注入。"""
+    cfg = load_config("config.yaml")
+    cfg.verifier.max_rounds = 3
+    control = Control()
+    # 决策里不带 remaining 字段 → 沿用原队列，两条任务都会跑
+    app = build_graph(cfg, llm=FakeLLM('{"note":"继续"}'), control=control)
+
+    seen: list[str] = []
+
+    def fake_worker(task, **kwargs):
+        seen.append(kwargs.get("guidance", ""))
+        if task == "t1":
+            # 第一条正在跑时投第二条：不打断它，等下一次调用再注入
+            control.push_note("worker", "第二条：记得写中文注释")
+        return CliResult(ok=True, output=f"done: {task}", duration=0.0)
+
+    def always_pass(_t, _v, _o, **_kw):
+        return Verdict(True, "通过", "", duration=0.0)
+
+    control.push_note("worker", "第一条：别动 index.html")
+    plan = [{"task": "t1", "verify": "ls a"}, {"task": "t2", "verify": "ls b"}]
+    with patch("lodestar_agent.graph.run_worker", side_effect=fake_worker), patch(
+        "lodestar_agent.graph.run_verifier", side_effect=always_pass
+    ):
+        app.invoke(
+            {"goal": "g", "plan": plan, "current": None, "attempts": 0,
+             "feedback": "", "records": []},
+            {"recursion_limit": 60},
+        )
+
+    assert "第一条" in seen[0] and "第二条" not in seen[0], seen
+    assert "第二条" in seen[1] and "第一条" not in seen[1], seen
+    assert control.pending_notes("worker") == [], control.pending_notes("worker")
+    print("ok  guidance_reaches_worker_once")
+
+
+def test_boundary_stop_waits_for_current_node() -> None:
+    """边界退出：正在跑的 worker 要跑完，验收不再开始，记录为「未验收」。"""
+    cfg = load_config("config.yaml")
+    control = Control()
+    llm = FakeLLM("不该被调用")
+    app = build_graph(cfg, llm=llm, control=control)
+
+    calls: list[str] = []
+    verdicts: list[str] = []
+
+    def finishing_worker(task, **_kwargs):
+        calls.append(task)
+        # 跑到一半时用户点退出 —— 关键：这次调用仍然正常返回，不被打断
+        control.request_stop("测试退出")
+        return CliResult(ok=True, output=f"done: {task}", duration=3.0)
+
+    def fake_verifier(task, *_a, **_kw):
+        verdicts.append(task)
+        return Verdict(True, "通过", "", duration=0.0)
+
+    plan = [{"task": "t1", "verify": "ls a"}, {"task": "t2", "verify": "ls b"}]
+    with patch("lodestar_agent.graph.run_worker", side_effect=finishing_worker), patch(
+        "lodestar_agent.graph.run_verifier", side_effect=fake_verifier
+    ):
+        out = app.invoke(
+            {"goal": "g", "plan": plan, "current": None, "attempts": 0,
+             "feedback": "", "records": []},
+            {"recursion_limit": 60},
+        )
+
+    assert calls == ["t1"], f"退出后不应再派新任务：{calls}"
+    assert verdicts == [], f"退出后不应开始验收（下一个模型调用）：{verdicts}"
+    assert out.get("draining") is True and not out.get("abort")
+    assert out["aborted_stage"] == "verify", out["aborted_stage"]
+    assert out["aborted_task"]["task"] == "t1"
+    rec = out["records"][0]
+    assert rec["verified"] is False and "未验收" in rec["reason"], rec
+    assert len(out.get("plan") or []) == 1, "剩余未执行任务应保留"
+    assert "边界退出" in out["answer"] and "未验收 1" in out["answer"], out["answer"]
+    assert llm.calls == 0, "退出路径不应再调模型"
+    print("ok  boundary_stop_waits_for_current_node")
+
+
+def test_forced_kill_marks_task_for_retry() -> None:
+    """超过等待上限被强杀：算 abort（不是 draining），resume 会重跑这条。"""
+    cfg = load_config("config.yaml")
+    control = Control(drain_timeout=0.01)
+    app = build_graph(cfg, llm=FakeLLM("不该被调用"), control=control)
+
+    def forcing_worker(task, **_kwargs):
+        control.request_stop("测试超时")
+        return CliResult(ok=False, output="", duration=60.0,
+                         error="超过等待上限仍未结束，已强制终止", aborted=True)
+
+    plan = [{"task": "t1", "verify": "ls a"}, {"task": "t2", "verify": "ls b"}]
+    with patch("lodestar_agent.graph.run_worker", side_effect=forcing_worker), patch(
+        "lodestar_agent.graph.run_verifier", side_effect=lambda *_a, **_k: Verdict(True, "通过", "")
+    ):
+        out = app.invoke(
+            {"goal": "g", "plan": plan, "current": None, "attempts": 0,
+             "feedback": "", "records": []},
+            {"recursion_limit": 60},
+        )
+
+    assert out.get("abort") is True and out.get("draining") is True
+    assert out["aborted_stage"] == "worker", out["aborted_stage"]
+    assert out["aborted_task"]["task"] == "t1"
+    assert out["records"][0]["verified"] is False
+    print("ok  forced_kill_marks_task_for_retry")
+
+
+def test_cancel_event_does_not_kill_running_cli() -> None:
+    """cancel 只表示「之后不许开新的」；已经跑起来的那一轮要让它自然结束。"""
+    if os.name == "nt":
+        print("skip  cancel_event_does_not_kill_running_cli（Windows 无 /bin/sh，进程树由 windows_tree_kill 覆盖）")
+        return
+    import threading
+    import time
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = Path(tmp) / "slow-cli"
+        fake.write_text(
+            "#!/bin/sh\nsleep 1\n"
+            'echo \'{"result":"finished","session_id":"s","is_error":false}\'\n',
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+
+        cancel = threading.Event()
+        cancel.set()  # 一开始就是「已请求退出」，模拟退出请求早于这次调用
+
+        started = time.time()
+        ok_result = run_worker(
+            "do", cwd=Path(tmp) / "wd", cli=str(fake), timeout=30,
+            cancel=cancel, drain_deadline=time.time() + 30,
+        )
+        elapsed = time.time() - started
+        assert ok_result.ok, ok_result.error
+        assert ok_result.output == "finished"
+        assert elapsed >= 0.9, f"不该提前掐断：{elapsed:.2f}s"
+
+        # 等待上限已经过了 → 才强杀
+        killed = run_worker(
+            "do", cwd=Path(tmp) / "wd2", cli=str(fake), timeout=30,
+            cancel=cancel, drain_deadline=time.time() + 0.05,
+        )
+        assert killed.aborted is True, killed
+        assert not killed.ok
+    print("ok  cancel_event_does_not_kill_running_cli")
+
+
+def test_model_call_is_really_cut_off() -> None:
+    """到点要断的是模型连接本身：断开后不再继续生成，也不重试。
+
+    这是「停掉模型」和「停掉脚本」的区别：非流式请求发出后服务端会把整段生成完，
+    本地放弃也没用；只有流式 + 主动断开，服务端才会停。
+    """
+    import time as _t
+
+    class SlowLLM:
+        def __init__(self):
+            self.finished = False
+
+        def stream(self, _p):
+            yield SimpleNamespace(content="{")
+            _t.sleep(5)          # 模拟服务端还在继续生成
+            yield SimpleNamespace(content="}")
+            self.finished = True
+
+        def invoke(self, _p):
+            raise AssertionError("不该退回非流式：那样断不掉服务端生成")
+
+    llm = SlowLLM()
+    started = _t.time()
+    try:
+        _invoke_interruptible(llm, "p", lambda: True)
+        raise AssertionError("应该在第一个 chunk 之后断开")
+    except ModelAborted:
+        pass
+    elapsed = _t.time() - started
+    assert elapsed < 2, f"没断开，等了 {elapsed:.1f}s"
+    assert llm.finished is False, "断开后不该再读到第二个 chunk"
+
+    # 不到点就不该断：完整收完
+    llm2 = SlowLLM()
+    llm2.stream = lambda _p: iter([SimpleNamespace(content="完整答案")])
+    msg = _invoke_interruptible(llm2, "p", lambda: False)
+    assert msg.content == "完整答案"
+    print("ok  model_call_is_really_cut_off")
+
+
+def test_drain_deadline_is_read_lazily() -> None:
+    """退出请求发生在 CLI 启动之后：deadline 必须每次轮询重新求值。
+
+    传死值（进入 run_cli 时求一次）时，那时还没点退出 → 永远是 None → 强杀分支
+    一次都不触发，表现就是「点了退出但进程不退、模型一直在跑」。
+    """
+    if os.name == "nt":
+        print("skip  drain_deadline_is_read_lazily（Windows 无 /bin/sh，进程树由 windows_tree_kill 覆盖）")
+        return
+    import threading
+    import time
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = Path(tmp) / "slow-cli"
+        fake.write_text("#!/bin/sh\nsleep 6\n", encoding="utf-8")
+        fake.chmod(0o755)
+
+        box = {"deadline": None}
+        cancel = threading.Event()
+        cancel.set()  # 已经在退出态，但「到点」是稍后才发生的
+        timer = threading.Timer(0.8, lambda: box.update(deadline=time.time() - 1))
+        timer.start()
+        try:
+            started = time.time()
+            result = run_worker(
+                "do", cwd=Path(tmp) / "wd", cli=str(fake), timeout=30,
+                cancel=cancel, drain_deadline=lambda: box["deadline"],
+            )
+            elapsed = time.time() - started
+        finally:
+            timer.cancel()
+
+        assert result.aborted is True, result
+        assert elapsed < 4, f"到点没强杀，等了 {elapsed:.1f}s（CLI 自己要睡 6s）"
+    print("ok  drain_deadline_is_read_lazily")
+
+
+def test_runner_lifecycle() -> None:
+    """页面驱动：start 占位 → 并发被拒 → 结束后状态回落 → reset 清掉上一轮的停止标志。"""
+    import threading
+
+    from lodestar_agent.session import Runner
+
+    cfg = load_config("config.yaml")
+    control = Control()
+    runner = Runner(cfg, control)
+
+    control.request_stop("上一轮的退出请求")
+    assert control.stop_requested
+
+    gate = threading.Event()
+
+    def fake_session(*_a, **_kw):
+        gate.wait(5)
+        return 0
+
+    with patch("lodestar_agent.session.run_session", side_effect=fake_session):
+        info = runner.start("第一个目标")
+        assert info["state"] == "running", info
+        assert not control.stop_requested, "start 应该把上一轮的停止标志清掉"
+        assert control.pending_notes("worker") == []
+        assert runner.busy
+
+        try:
+            runner.start("并发目标")
+            raise AssertionError("运行中应拒绝并发提交")
+        except RuntimeError:
+            pass
+
+        gate.set()
+        runner.join(5)
+
+    assert not runner.busy
+    s = runner.session
+    assert s["state"] == "done" and s["code"] == 0, s
+    assert s["goal"] == "第一个目标" and s["thread"]
+    print("ok  runner_lifecycle")
+
+
+def test_runner_model_override() -> None:
+    """页面选模型：传值就覆盖配置，传空串 = 显式用 CLI 默认，传 None = 沿用配置。"""
+    from lodestar_agent.session import Runner
+
+    cfg = load_config("config.yaml")
+    cfg.worker.model = "glm-5.3"
+    cfg.verifier.model = "kimi-k3.1-pro"
+    control = Control()
+    runner = Runner(cfg, control)
+    seen: dict = {}
+
+    def fake_session(cfg_arg, goal, thread, *, control, con, resume, dry_run):
+        seen["worker"] = cfg_arg.worker.model
+        seen["verifier"] = cfg_arg.verifier.model
+        return 0
+
+    with patch("lodestar_agent.session.run_session", side_effect=fake_session):
+        runner.start("t1", worker_model="deepseek-v4.1-flash", verifier_model="")
+        runner.join(5)
+        assert seen == {"worker": "deepseek-v4.1-flash", "verifier": ""}, seen
+
+        runner.start("t2", worker_model=None, verifier_model=None)
+        runner.join(5)
+        # None = 不覆盖，沿用上次设置后的值
+        assert seen == {"worker": "deepseek-v4.1-flash", "verifier": ""}, seen
+
+        runner.start("t3", worker_model="deepseek-v4-pro", verifier_model="glm-5.2")
+        runner.join(5)
+        assert seen == {"worker": "deepseek-v4-pro", "verifier": "glm-5.2"}, seen
+    print("ok  runner_model_override")
+
+
+def test_build_tasks_states() -> None:
+    """任务清单：三态映射对、同一条重跑只留最后一次、当前和剩余都在。"""
+    from lodestar_agent.session import build_tasks
+
+    state = {
+        "records": [
+            {"task": "A", "verify": "v", "passed": True, "verified": True,
+             "attempts": 1, "duration": 3.0, "reason": "通过"},
+            {"task": "B", "verify": "v", "passed": False, "verified": False,
+             "attempts": 1, "duration": 2.0, "reason": "已执行，未验收"},
+            # A 后来重跑过且失败：清单里应该只剩最后这条
+            {"task": "A", "verify": "v", "passed": False, "verified": True,
+             "attempts": 2, "duration": 4.0, "reason": "缺参数"},
+        ],
+        "current": {"task": "C", "verify": "v"},
+        "attempts": 2,
+        "last_duration": 1.5,
+        "plan": [{"task": "D", "verify": "v"}],
+    }
+    tasks = build_tasks(state)
+
+    assert [t["task"] for t in tasks] == ["A", "B", "C", "D"], tasks
+    assert [t["status"] for t in tasks] == ["fail", "skip", "running", "pending"], tasks
+    assert tasks[0]["attempts"] == 2, "同一条应保留最后一次"
+    assert tasks[2]["attempts"] == 2 and tasks[2]["duration"] == 1.5
+    print("ok  build_tasks_states")
+
+
+def test_config_overrides() -> None:
+    """页面配置：白名单、范围校验、掩码不回写、lines/kv 解析、写回 local 覆盖层。"""
+    from lodestar_agent.config import (
+        as_editable, collect_overrides, mask_key, save_overrides,
+    )
+
+    real_key = "sk-abcdefgh12345678"
+    masked = mask_key(real_key)
+    assert masked != real_key and masked.startswith("sk-a"), masked
+
+    # 掩码 / 空值不回写
+    patch, errors = collect_overrides(
+        {"main_agent": {"api_key": masked, "model": "m1"}}, real_key
+    )
+    assert errors == [] and patch == {"main_agent": {"model": "m1"}}, patch
+    patch, _ = collect_overrides({"main_agent": {"api_key": ""}}, real_key)
+    assert patch == {}, "空 key 不该覆盖已有值"
+
+    # 填了新 key 才写
+    patch, _ = collect_overrides({"main_agent": {"api_key": "sk-new"}}, real_key)
+    assert patch["main_agent"]["api_key"] == "sk-new"
+
+    # 白名单：未知字段忽略
+    patch, _ = collect_overrides({"main_agent": {"evil": "x"}, "nope": {"a": 1}})
+    assert patch == {}, patch
+
+    # 范围校验
+    _, errors = collect_overrides({"main_agent": {"temperature": 9}})
+    assert errors and "temperature" in errors[0], errors
+
+    # lines / kv
+    patch, _ = collect_overrides({
+        "worker": {"add_dirs": "a\nb", "env": "A=1\nB=2", "max_turns": "7"},
+    })
+    assert patch["worker"]["add_dirs"] == ["a", "b"]
+    assert patch["worker"]["env"] == {"A": "1", "B": "2"}
+    assert patch["worker"]["max_turns"] == 7
+
+    # 模型候选：空串是「默认（CLI 决定）」，不写进配置（否则保存一次就被过滤掉）
+    view = as_editable(load_config("config.yaml"))
+    assert view["ui"]["models"] and not view["ui"]["models"].startswith("\n"), view["ui"]
+    patch, _ = collect_overrides({"ui": {"models": view["ui"]["models"]}})
+    assert "" not in patch["ui"]["models"] and patch["ui"]["models"], patch["ui"]
+
+    # 写回 config.local.yaml，并且多次保存不会互相覆盖
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        cfg_file = root / "config.yaml"
+        cfg_file.write_text(
+            "main_agent:\n  base_url: 'https://x'\n  model: 'base'\n"
+            "worker:\n  model: ''\nverifier:\n  model: ''\n",
+            encoding="utf-8",
+        )
+        save_overrides(root, {"worker": {"model": "glm-5.3"}})
+        assert load_config(cfg_file).worker.model == "glm-5.3"
+
+        save_overrides(root, {"verifier": {"model": "kimi-k3.1-pro"}})
+        cfg = load_config(cfg_file)
+        assert cfg.worker.model == "glm-5.3", "第二次保存不该冲掉第一次的字段"
+        assert cfg.verifier.model == "kimi-k3.1-pro"
+        assert (root / "config.local.yaml").exists()
+    print("ok  config_overrides")
+
+
+def test_windows_tree_kill() -> None:
+    """Windows 没有 killpg：停止任务时应该走 taskkill /T /F，把 CLI 的 node 子进程一起收掉。"""
+    from types import SimpleNamespace
+
+    from lodestar_agent import worker
+
+    seen: dict = {}
+
+    class FakeProc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            seen["killed"] = True
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0)
+
+    with patch("lodestar_agent.worker.os.name", "nt"), patch(
+        "lodestar_agent.worker.subprocess.run", side_effect=fake_run
+    ):
+        worker._terminate_tree(FakeProc())
+
+    cmd = seen["cmd"]
+    assert cmd[:4] == ["taskkill", "/PID", "4321", "/T"], cmd
+    assert "/F" in cmd, cmd
+    assert "creationflags" in seen["kwargs"], "Windows 下不应该闪黑框"
+
+    # Windows 环境变量大小写不敏感：SystemRoot / Path 必须能传给 node
+    fake_env = {
+        "SystemRoot": "C:\\Windows", "Path": "C:\\Windows\\System32",
+        "USERPROFILE": "C:\\Users\\x", "CODEBUDDY_SERVER_PORT": "7777",
+        "UNRELATED_HOST_VAR": "drop-me",
+    }
+    with patch("lodestar_agent.worker.os.name", "nt"), patch.dict(
+        "lodestar_agent.worker.os.environ", fake_env, clear=True
+    ):
+        env = worker._child_env({"EXTRA": "1"})
+    assert env["SYSTEMROOT"] == "C:\\Windows", env
+    assert env["PATH"] == "C:\\Windows\\System32", env
+    assert "CODEBUDDY_SERVER_PORT" not in env, "宿主注入的变量不能带进去"
+    assert "UNRELATED_HOST_VAR" not in env, env
+    assert env["CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS"] == "1", env
+
+    # npm 全局命令在 Windows 上是 .cmd shim，要走 cmd.exe /c；.exe 直接执行
+    with patch("lodestar_agent.worker.os.name", "nt"), patch.dict(
+        "lodestar_agent.worker.os.environ", {"COMSPEC": "C:\\Windows\\System32\\cmd.exe"},
+        clear=True,
+    ):
+        argv = worker._cli_argv("C:\\npm\\codebuddy.cmd", ["-p", "hi"])
+    assert argv[:4] == [
+        "C:\\Windows\\System32\\cmd.exe", "/c", "C:\\npm\\codebuddy.cmd", "-p",
+    ], argv
+    assert worker._cli_argv("/usr/local/bin/codebuddy", ["-p"])[0].endswith("codebuddy")
+    print("ok  windows_tree_kill")
+
+
+def test_folder_picker() -> None:
+    """系统文件夹选择器：mac / Windows 命令构造、取消、报错、路径清洗。"""
+    import base64
+    import os
+
+    from lodestar_agent import fspick
+    from lodestar_agent.fspick import PickUnavailable
+
+    with tempfile.TemporaryDirectory() as tmp:
+        picked = os.path.normpath(tmp)
+        done = SimpleNamespace(returncode=0, stdout=tmp + "\n", stderr="")
+
+        # macOS：osascript 返回 POSIX 路径，末尾换行要被清掉
+        with patch("lodestar_agent.fspick.sys.platform", "darwin"), patch(
+            "lodestar_agent.fspick._run", return_value=done
+        ):
+            assert fspick.pick_directory() == picked, "选中的目录没返回"
+
+        # 用户取消：空输出 → None，不当作错误
+        cancel = SimpleNamespace(returncode=0, stdout="\n", stderr="")
+        with patch("lodestar_agent.fspick.sys.platform", "darwin"), patch(
+            "lodestar_agent.fspick._run", return_value=cancel
+        ):
+            assert fspick.pick_directory() is None
+
+        # osascript 报错 / 选中的目录已经不存在 → 说清楚原因
+        bad = SimpleNamespace(returncode=1, stdout="", stderr="not allowed\n")
+        with patch("lodestar_agent.fspick.sys.platform", "darwin"), patch(
+            "lodestar_agent.fspick._run", return_value=bad
+        ):
+            try:
+                fspick.pick_directory()
+                raise AssertionError("非零退出码应该报错")
+            except PickUnavailable as exc:
+                assert "not allowed" in str(exc), exc
+
+        gone = SimpleNamespace(returncode=0, stdout=str(Path(tmp) / "nope"), stderr="")
+        with patch("lodestar_agent.fspick.sys.platform", "darwin"), patch(
+            "lodestar_agent.fspick._run", return_value=gone
+        ):
+            try:
+                fspick.pick_directory()
+                raise AssertionError("不存在的目录应该报错")
+            except PickUnavailable as exc:
+                assert "目录不存在" in str(exc), exc
+
+        # Windows：脚本走 EncodedCommand，中文提示不能丢
+        seen: dict = {}
+
+        def fake_run(cmd, timeout):
+            seen["cmd"] = cmd
+            return SimpleNamespace(returncode=0, stdout=tmp, stderr="")
+
+        def fake_which(name):
+            return "/usr/bin/powershell" if name in ("powershell.exe", "powershell") else None
+
+        with patch("lodestar_agent.fspick.shutil.which", side_effect=fake_which), patch(
+            "lodestar_agent.fspick._run", side_effect=fake_run
+        ):
+            assert fspick._pick_windows("选择目录", 1) == tmp
+        cmd = seen["cmd"]
+        assert "-EncodedCommand" in cmd, cmd
+        script = base64.b64decode(cmd[-1]).decode("utf-16-le")
+        assert "FolderBrowserDialog" in script and "选择目录" in script, script
+        assert "[Console]::OutputEncoding" in script, "中文路径需要强制 UTF-8 输出"
+
+        # Linux：zenity 的退出码 1 = 用户取消
+        with patch(
+            "lodestar_agent.fspick.shutil.which",
+            side_effect=lambda n: "/usr/bin/zenity" if n == "zenity" else None,
+        ), patch(
+            "lodestar_agent.fspick._run",
+            return_value=SimpleNamespace(returncode=1, stdout="", stderr=""),
+        ):
+            assert fspick._pick_linux("选择目录", 1) == ""
+
+        # 一个都没有 → 明确提示装 zenity / kdialog
+        with patch("lodestar_agent.fspick.shutil.which", return_value=None):
+            try:
+                fspick._pick_linux("选择目录", 1)
+                raise AssertionError("没有选择器命令时应该报错")
+            except PickUnavailable as exc:
+                assert "zenity" in str(exc), exc
+
+    print("ok  folder_picker")
+
+
+def test_history_store_and_api() -> None:
+    """左侧导航：按 workdir 分组、同目录多会话、续跑判断、/history 接口。"""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    from lodestar_agent.history import HistoryStore, uuid_time
+    from lodestar_agent.server import ConsoleServer
+    from lodestar_agent.session import Runner
+
+    # 老 checkpoint 没有 history.json，排序靠 uuid6 里的时间戳
+    assert uuid_time("1f0e7c9a-1c00-6000-8000-000000000000") > 1_700_000_000
+    assert uuid_time("not-a-uuid") == 0
+    assert uuid_time("") == 0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        dir_a = tmp / "proj-a"
+        dir_b = tmp / "proj-b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        default_dir = tmp / "workspace"
+        db = tmp / "checkpoints.sqlite"
+
+        store = HistoryStore(tmp)
+        store.begin("t-a", "目标 A", str(dir_a), worker_model="m1")
+        store.finish("t-a", 0, answer="A 完成", passed=1, failed=0)
+        store.begin("t-b", "目标 B", str(dir_b))
+        store.finish("t-b", 130, error="边界退出")
+        store.begin("t-c", "目标 C", str(dir_a))  # 故意不结束：模拟进程被强杀
+        store.begin("t-d", "目标 D", str(dir_a))
+        store.finish("t-d", 1, passed=0, failed=1)
+
+        # 一个目录 = 一个项目，目录下可以有多条会话
+        groups = store.groups(db, str(default_dir), current="t-c")
+        projects = {p["name"]: p for p in groups["projects"]}
+        assert set(projects) == {"proj-a", "proj-b"}, projects
+        assert projects["proj-a"]["count"] == 3, projects["proj-a"]
+        assert projects["proj-b"]["count"] == 1, projects["proj-b"]
+        by_thread = {i["thread"]: i for p in groups["projects"] for i in p["items"]}
+        assert by_thread["t-c"]["state"] == "running", by_thread["t-c"]
+
+        # 不是当前这次还挂着 running，就是上次被强杀了
+        stale = store.groups(db, str(default_dir))
+        stale_items = {i["thread"]: i for p in stale["projects"] for i in p["items"]}
+        assert stale_items["t-c"]["state"] == "aborted", stale_items["t-c"]
+        assert stale_items["t-c"]["interrupted"], stale_items["t-c"]
+
+        # 老记录没有 workdir：归到默认产出目录，而不是凭空消失
+        data = store._read()
+        data["items"][0]["workdir"] = ""
+        store._write(data)
+        groups2 = store.groups(db, str(default_dir))
+        assert any(p["workdir"] == str(default_dir) for p in groups2["projects"]), groups2
+
+        detail = store.detail(db, "t-a", str(default_dir))
+        assert detail and detail["state"] == "done", detail
+        assert detail["answer"] == "A 完成" and detail["workdir"] == str(dir_a), detail
+
+        # 任务清单 + 能不能续：边界退出的线程 next 为空但 abort 为真，应该可续
+        snap = {
+            "records": [
+                {"task": "t1", "verify": "v", "passed": True, "attempts": 1, "duration": 1.0},
+                {"task": "t2", "verify": "v", "passed": False, "verified": False, "attempts": 1},
+            ],
+            "current": {}, "pending": [],
+            "abort": True, "draining": False, "last_error": "", "has_pending": False,
+        }
+        with patch("lodestar_agent.history.read_checkpoint", return_value=snap):
+            item = store.detail(db, "t-a", str(default_dir))
+        assert item["resumable"] is True, item
+        assert [t["status"] for t in item["tasks"]] == ["pass", "skip"], item["tasks"]
+
+        # 正常跑完（无 aborted / 无未完成写入）不可续；执行失败 / 有未完成写入可续
+        for snap_state, flag in (
+            ({"abort": False, "draining": False, "last_error": "", "has_pending": False}, False),
+            ({"abort": False, "draining": False, "last_error": "boom", "has_pending": False}, True),
+            ({"abort": False, "draining": False, "last_error": "", "has_pending": True}, True),
+            ({"abort": False, "draining": True, "last_error": "", "has_pending": False}, True),
+        ):
+            with patch("lodestar_agent.history.read_checkpoint", return_value=snap_state):
+                got = store.detail(db, "t-a", str(default_dir))
+            assert got["resumable"] is flag, (snap_state, got["resumable"])
+        assert store.detail(db, "nope", str(default_dir)) is None
+
+        # HTTP 接口：左侧导航与详情页的数据源
+        cfg = load_config("config.yaml")
+        cfg.root = tmp
+        control = Control()
+        runner = Runner(cfg, control)
+        server = ConsoleServer(control, meta={}, runner=runner, host="127.0.0.1", port=0).start()
+        base = server.url.rstrip("/")
+        try:
+            with urllib.request.urlopen(base + "/history", timeout=5) as resp:
+                body = _json.loads(resp.read())
+            assert body["ok"] and body["total"] == 4, body
+            assert len(body["projects"]) == 3, body["projects"]
+
+            with urllib.request.urlopen(base + "/history/t-a", timeout=5) as resp:
+                one = _json.loads(resp.read())
+            assert one["ok"] and one["item"]["thread"] == "t-a", one
+
+            try:
+                urllib.request.urlopen(base + "/history/nope", timeout=5)
+                raise AssertionError("不存在的会话应返回 404")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 404, exc.code
+        finally:
+            server.stop()
+
+    print("ok  history_store_and_api")
+
+
+def test_web_console_guide_and_stop() -> None:
+    """控制台：页面可访问、引导能投递、事件流可重放、退出请求能置位。"""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    from lodestar_agent.server import ConsoleServer
+
+    control = Control()
+    server = ConsoleServer(control, meta={"thread": "t-web"}, host="127.0.0.1", port=0).start()
+    base = server.url.rstrip("/")
+
+    def post(payload: dict) -> dict:
+        req = urllib.request.Request(
+            base + "/command",
+            data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        return _json.loads(urllib.request.urlopen(req, timeout=5).read())
+
+    try:
+        html = urllib.request.urlopen(base + "/", timeout=5).read().decode("utf-8")
+        assert 'id="root"' in html, "页面没加载出来"
+        assert "/assets/" in html, "构建产物没被引用（先 cd frontend && npm run build）"
+
+        assert post({"type": "guide", "target": "worker", "text": "别动 a.txt"})["ok"]
+        assert control.pending_notes("worker")[0]["text"] == "别动 a.txt"
+
+        # SSE：先来一条注释帧，再补发 backlog 里的事件
+        with urllib.request.urlopen(base + "/events?since=0", timeout=5) as resp:
+            assert resp.headers["Content-Type"].startswith("text/event-stream")
+            assert resp.readline().decode().startswith(":")
+
+        assert post({"type": "stop"})["ok"]
+        assert control.stop_requested
+
+        try:
+            post({"type": "guide", "target": "main", "text": "   "})
+            raise AssertionError("空引导应被拒绝")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 400, exc.code
+
+        # 目录选择：后端返回绝对路径 / 取消，不要把异常抛成 500
+        with tempfile.TemporaryDirectory() as picked:
+            with patch("lodestar_agent.server.pick_directory", return_value=picked):
+                res = post({"type": "pickdir"})
+            assert res["ok"] and res["path"] == picked, res
+
+        with patch("lodestar_agent.server.pick_directory", return_value=None):
+            res = post({"type": "pickdir"})
+        assert res["ok"] and res["canceled"] is True, res
+
+        from lodestar_agent.fspick import PickUnavailable
+
+        with patch("lodestar_agent.server.pick_directory",
+                   side_effect=PickUnavailable("当前环境没有图形界面")):
+            try:
+                post({"type": "pickdir"})
+                raise AssertionError("打不开选择器应该返回 400")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 400, exc.code
+    finally:
+        server.stop()
+
+    print("ok  web_console_guide_and_stop")
+
+
 def test_worker_against_fake_cli() -> None:
     """用一个假 CLI 验证子进程调用 + JSON 解析（真实的 codebuddy 行为由登录后实测）。"""
+    if os.name == "nt":
+        print("skip  worker_against_fake_cli（Windows 无 /bin/sh；JSON 解析由 json_parse_with_noise 覆盖）")
+        return
     with tempfile.TemporaryDirectory() as tmp:
         fake = Path(tmp) / "fake-codebuddy"
         fake.write_text(
@@ -396,5 +1133,19 @@ if __name__ == "__main__":
     test_resume_after_exec_failure_resets_attempts()
     test_json_parse_with_noise()
     test_diagnose_never_dumps_transcript()
+    test_guidance_reaches_worker_once()
+    test_boundary_stop_waits_for_current_node()
+    test_forced_kill_marks_task_for_retry()
+    test_cancel_event_does_not_kill_running_cli()
+    test_model_call_is_really_cut_off()
+    test_drain_deadline_is_read_lazily()
+    test_runner_lifecycle()
+    test_runner_model_override()
+    test_build_tasks_states()
+    test_config_overrides()
+    test_windows_tree_kill()
+    test_folder_picker()
+    test_history_store_and_api()
+    test_web_console_guide_and_stop()
     test_worker_against_fake_cli()
     print("\n全部通过")

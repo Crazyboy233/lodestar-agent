@@ -1,13 +1,15 @@
 [project]
-name = "langgraph-worker-demo"
+name = "lodestar-agent"
 version = "0.1.0"
-description = "LangGraph 主 agent + CodeBuddy CLI worker agent 小实验"
+description = "Lodestar：LangGraph 主 agent（动态 plan）+ CodeBuddy CLI worker + 独立验收 agent"
 requires-python = ">=3.10"
 dependencies = [
     "langgraph>=0.6.0",
     "langchain-openai>=0.3.0",
     "pyyaml>=6.0",
     "langgraph-checkpoint-sqlite>=2.0.0",
+    "fastapi>=0.162.0",
+    "uvicorn>=0.54.0",
 ]
 
 [tool.uv]
