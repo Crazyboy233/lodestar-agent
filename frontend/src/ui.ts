@@ -84,3 +84,25 @@ export function modelOptions(meta: RunMeta): string[] {
   }
   return base;
 }
+
+/**
+ * 清屏页（新任务）上的开场白：每次点「新任务」随机换一句。
+ * 语气故意混着来——有正经交代事的，也有随口一问的，别让每次开新任务都像同一句模板。
+ */
+const LAUNCH_LINES = [
+  '给一个目标，剩下的交给它。',
+  '先想清楚要做什么，再让它动手。',
+  '今天想让它干点什么？',
+  '拆解、执行、验收，一件一件来。',
+  '目标写清楚，活就干得漂亮。',
+  '有事交代，说一句就够了。',
+  '从一句话开始，看着事情做完。',
+  '它已经在等你的第一个目标了。',
+];
+
+/** 随机取一句；给了上一句就避开它，免得连点两次看着像没反应 */
+export function pickLaunchLine(prev?: string): string {
+  const pool = LAUNCH_LINES.filter((x) => x !== prev);
+  const list = pool.length ? pool : LAUNCH_LINES;
+  return list[Math.floor(Math.random() * list.length)];
+}

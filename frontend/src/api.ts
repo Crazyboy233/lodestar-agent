@@ -48,6 +48,19 @@ export async function fetchHistoryDetail(thread: string): Promise<HistoryDetailR
   return json<HistoryDetailResponse>(res);
 }
 
+/**
+ * 删除一条会话历史。后端会连同它的 checkpoint 一起删掉，之后不能再续跑。
+ * 409 = 这条正在跑，404 = 已经被删过了；两种都带 JSON 错误文案，原样透出去。
+ */
+export async function deleteHistory(thread: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/history/${encodeURIComponent(thread)}`, { method: 'DELETE' });
+    return await json<{ ok: boolean; error?: string }>(res);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export interface CommandResponse {
   ok: boolean;
   session?: Session;

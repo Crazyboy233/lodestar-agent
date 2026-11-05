@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { HistoryDetail, HistoryGroups } from '../types';
-import { fetchHistory, fetchHistoryDetail, reportClient } from '../api';
+import {
+  deleteHistory, fetchHistory, fetchHistoryDetail, reportClient,
+} from '../api';
 
 const EMPTY_HISTORY: HistoryGroups = { ok: true, total: 0, projects: [] };
 const POLL_FIRST_MS = 1200;
@@ -64,8 +66,16 @@ export function useHistory({ polling }: { polling: boolean }) {
     setDetailError('');
   }, []);
 
+  /** 删一条历史；成功返回 null，失败返回给页面看的错误文案 */
+  const remove = useCallback(async (thread: string): Promise<string | null> => {
+    const res = await deleteHistory(thread);
+    if (!res.ok) return res.error || '删除失败';
+    await refresh();
+    return null;
+  }, [refresh]);
+
   return {
     groups, loading, detail, detailLoading, detailError,
-    refresh, load, clearDetail,
+    refresh, load, clearDetail, remove,
   };
 }

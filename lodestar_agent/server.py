@@ -2,7 +2,7 @@
 
 前端是 React（`frontend/` 构建到 `static/`），这里只做三件事，不含任何页面内容：
 
-  1. JSON 接口：`/state` / `/config` / `/command`
+  1. JSON 接口：`/state` / `/config` / `/command` / `/history`
   2. SSE 事件流：`/events`（带 seq，断线重连按 since 补发）
   3. 托管构建产物：`/` 和 `/assets/*`
 
@@ -156,6 +156,23 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
         if item is None:
             return JSONResponse({"ok": False, "error": f"没有这个会话：{thread}"}, status_code=404)
         return JSONResponse({"ok": True, "item": item})
+
+    @app.delete("/history/{thread}")
+    def delete_history(thread: str) -> JSONResponse:
+        """删掉一条会话历史（json 条目 + 它的 checkpoint），删掉后不能再续跑。"""
+        if runner is None:
+            return JSONResponse({"ok": False, "error": "当前进程没有绑定运行器"}, status_code=400)
+        cfg = runner.cfg
+        # 正在跑的那条不能删：图还挂在它的 thread 上，删库会让后续写入没地方落
+        current = runner.session.get("thread", "") if runner.busy else ""
+        if current and current == thread:
+            return JSONResponse(
+                {"ok": False, "error": "这个会话正在运行，等它结束再删"}, status_code=409,
+            )
+        store = HistoryStore(cfg.root)
+        if not store.delete(cfg.root / "checkpoints.sqlite", thread):
+            return JSONResponse({"ok": False, "error": f"没有这个会话：{thread}"}, status_code=404)
+        return JSONResponse({"ok": True})
 
     @app.get("/events")
     async def get_events(since: int = Query(0)) -> StreamingResponse:

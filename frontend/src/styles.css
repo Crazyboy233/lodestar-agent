@@ -136,25 +136,38 @@
   }
 
   /* ── 新任务 / 运行中：上方过程区，下方独立的圆角输入卡 ── */
-  /* 主区域按 screen 条件渲染（history 只挂 HistoryView，launch 不挂 aside），
-     这里只调整 grid 的列数，不再靠 display:none 兜底 */
-  body[data-view="launch"] main { grid-template-columns: 1fr; }
+  /* 主区域按 screen 条件渲染（history 只挂 HistoryView，launch 不挂 aside） */
+  /* 清屏页：欢迎语在上、输入卡在下，两块作为一个整体垂直居中
+     （用 flex 而不是 grid 居中：行高按内容算，卡片高度变了也不用改模板） */
+  body[data-view="launch"] main {
+    grid-template-columns: 1fr;
+    display: flex; flex-direction: column; justify-content: center;
+    overflow-y: auto;
+  }
 
-  .welcome-wrap {
-    display: flex; align-items: center; justify-content: center;
-    padding: 32px;
+  .launch-blank {
+    flex: 0 0 auto; align-items: center; justify-content: center;
+    padding: 0 22px 18px;
   }
-  .welcome { max-width: 560px; text-align: center; }
-  .welcome-mark {
-    display: inline-flex; align-items: center; gap: 9px;
-    font-size: 22px; font-weight: 650; letter-spacing: .2px;
+  .launch-line {
+    max-width: 620px; margin: 0; text-align: center;
+    font-size: clamp(19px, 2vw, 23px); line-height: 1.7; font-weight: 500;
+    letter-spacing: .01em; color: var(--text);
+    /* 中文短句折行时两边尽量等长，不要出现孤零零一两个字 */
+    text-wrap: balance;
+    animation: launch-in .36s ease both;
   }
-  .welcome-mark::before {
-    content: ""; width: 11px; height: 11px; border-radius: 3px;
-    background: var(--accent); transform: rotate(45deg);
+  /* 每换一句都重新挂载，动画跟着重播一次，换句看得出来 */
+  @keyframes launch-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
   }
-  .welcome p { margin: 10px 0 6px; color: var(--muted); font-size: 13.5px; }
-  .welcome span { color: var(--faint); font-size: 12px; }
+  @media (prefers-reduced-motion: reduce) {
+    .launch-line { animation: none; }
+  }
+  @media (max-width: 860px) {
+    .launch-blank { padding: 0 16px 14px; }
+  }
 
   /* ── 历史会话（只读预览） ── */
   body[data-view="history"] main {
@@ -398,6 +411,40 @@
     grid-column: 2; grid-row: 1 / span 2;
     border-left: 1px solid var(--border); background: var(--panel);
     display: flex; flex-direction: column; min-height: 0; overflow-y: auto;
+  }
+
+  /* ── 视图过渡：开跑时卡片沉底、右侧抽屉滑出 ──
+     布局在这两个状态之间是整块换的（居中 flex ⇄ 两列 grid），CSS 补不了间，
+     所以给这两块起名，交给浏览器的 View Transitions 各自平移缩放，其余交叉淡入。
+     名字挂在卡片而不是外面的 .composer-zone 上：卡片宽度只受所在列影响，
+     缩放幅度小得多，字不会被挤变形。 */
+  .composer-card { view-transition-name: composer; }
+  aside { view-transition-name: side; }
+
+  ::view-transition-group(composer) {
+    animation-duration: .34s;
+    animation-timing-function: cubic-bezier(.22, .8, .28, 1);
+  }
+  /* 卡里的内容换了一套（新任务卡 → 引导卡）：旧图先快速退场、新图稍晚进来，
+     中间那段路看到的是「同一张卡在移动」，而不是两层字叠着抖 */
+  ::view-transition-old(composer) { animation: vt-out .12s ease both; }
+  ::view-transition-new(composer) { animation: vt-in .2s ease .1s both; }
+
+  ::view-transition-group(side) {
+    animation-duration: .34s;
+    animation-timing-function: cubic-bezier(.22, .8, .28, 1);
+  }
+  ::view-transition-new(side) { animation: side-in .34s cubic-bezier(.22, .8, .28, 1) both; }
+  ::view-transition-old(side) { animation: side-out .2s ease both; }
+
+  @keyframes vt-out { to { opacity: 0; } }
+  @keyframes vt-in { from { opacity: 0; } }
+  @keyframes side-in {
+    from { opacity: 0; transform: translateX(28px); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes side-out {
+    to { opacity: 0; transform: translateX(28px); }
   }
   .card { padding: 14px 16px; border-bottom: 1px solid var(--border); }
   .card h2 { margin: 0 0 3px; font-size: 12.5px; font-weight: 600; letter-spacing: .2px; }
@@ -662,6 +709,44 @@
   .hi-meta[data-state="failed"], .hi-meta[data-state="error"] { color: var(--fail); }
   .hi-meta[data-state="aborted"] { color: var(--stop); }
   .hi-meta[data-state="running"] { color: var(--worker); }
+  /* 一行历史 = 主按钮 + 右侧删除按钮。按钮里不能再套按钮（HTML 不允许），
+     所以删除按钮放在行上绝对定位，悬停才显形，平时不占视觉。 */
+  .hi-row { position: relative; }
+  .hi-row .hi { padding-right: 24px; }
+  .hi-del {
+    position: absolute; right: 3px; top: 50%; transform: translateY(-50%);
+    width: 20px; height: 20px; display: flex; align-items: center; justify-content: center;
+    padding: 0; border: 0; border-radius: 5px; background: transparent;
+    color: var(--faint); cursor: pointer; opacity: 0; transition: opacity .12s ease;
+  }
+  .hi-row:hover .hi-del, .hi-row:focus-within .hi-del, .hi-del:focus-visible { opacity: 1; }
+  .hi-del:hover {
+    background: color-mix(in srgb, var(--fail) 12%, transparent); color: var(--fail);
+  }
+  /* 确认条盖住整行：只露出「删除？」和两个按钮，避免点错 */
+  .hi-confirm {
+    position: absolute; inset: 0; display: flex; align-items: center; gap: 6px;
+    padding: 0 6px 0 10px; border-radius: 7px;
+    background: var(--panel-2); box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+  .hi-confirm-q {
+    flex: 1; min-width: 0; font-size: 11.5px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .hi-confirm button {
+    flex: 0 0 auto; padding: 3px 8px; border-radius: 5px; border: 1px solid transparent;
+    font-family: inherit; font-size: 11.5px; cursor: pointer;
+  }
+  .hi-confirm-yes { background: var(--fail); color: #fff; }
+  .hi-confirm-yes:hover:not(:disabled) { filter: brightness(1.06); }
+  .hi-confirm-no { background: transparent; color: var(--muted); border-color: var(--border-strong); }
+  .hi-confirm-no:hover:not(:disabled) { color: var(--text); }
+  .hi-confirm button:disabled { opacity: .6; cursor: default; }
+  .side-err {
+    margin: 0 8px 6px; padding: 6px 8px; border-radius: 6px;
+    font-size: 11.5px; line-height: 1.45; color: var(--fail);
+    background: color-mix(in srgb, var(--fail) 8%, transparent);
+  }
   .side-foot {
     flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
     padding: 9px 14px; border-top: 1px solid var(--border);

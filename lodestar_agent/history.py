@@ -89,6 +89,29 @@ def read_checkpoint(db_path: Path, thread: str) -> dict:
         return {}
 
 
+def drop_checkpoints(db_path: Path, thread: str) -> bool:
+    """删掉一个 thread 在 checkpoint 库里的全部行。删到东西返回 True。
+
+    走可写的连接而不是 `_ro_uri`；给 timeout 是怕正好撞上别的进程在写，
+    宁可这里失败让调用方报错，也不要无限期卡住页面请求。
+    """
+    if not db_path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=2.0)
+    except sqlite3.Error:
+        return False
+    try:
+        with conn:  # 同一个事务：writes 与 checkpoints 要么都删，要么都不删
+            n = conn.execute("delete from writes where thread_id = ?", (thread,)).rowcount
+            n += conn.execute("delete from checkpoints where thread_id = ?", (thread,)).rowcount
+        return (n or 0) > 0
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
 def _scan_checkpoints(db_path: Path) -> list[dict]:
     """扫 checkpoints 表，按 thread 聚合出老记录。"""
     if not db_path.exists():
@@ -236,6 +259,26 @@ class HistoryStore:
                 return
             item["goal"] = goal
             self._write(data)
+
+    # ── 删除 ──────────────────────────────────────────────
+    def delete(self, db_path: Path, thread: str) -> bool:
+        """删掉一条历史：json 里的条目 + 这个 thread 的 checkpoint。
+
+        checkpoint 必须跟着删：`_merged()` 会拿库里的老 thread 回填没记录过的会话，
+        只删 json 的话刷新一下它就又冒出来了（还标成 bootstrap）。删到东西返回 True。
+        """
+        removed = False
+        with self._lock:
+            data = self._read()
+            items = data.get("items") or []
+            keep = [x for x in items if x.get("thread") != thread]
+            if len(keep) != len(items):
+                data["items"] = keep
+                self._write(data)
+                removed = True
+        if drop_checkpoints(db_path, thread):
+            removed = True
+        return removed
 
     # ── 读取 ──────────────────────────────────────────────
     def items(self) -> list[dict]:

@@ -16,6 +16,10 @@ interface UiState {
 }
 
 const INITIAL: UiState = { thread: null, welcome: false, resume: null };
+/** 新任务那一屏：welcome 必须真的是 true。
+    screen 的判定是「welcome || idle → launch」，只清干净不清成 true 的话，
+    上一次跑完（state 还是 done）点「新任务」就原地不动 —— 界面停在运行页。 */
+const WELCOME: UiState = { thread: null, welcome: true, resume: null };
 
 /**
  * 页面在「哪一屏 + 哪一种输入区」上的唯一真相。
@@ -28,7 +32,7 @@ export function useUiMode(sessionState: SessionState) {
   const [state, setState] = useState<UiState>(INITIAL);
 
   /** 新任务：回到欢迎页，丢掉待续跑 */
-  const showWelcome = useCallback(() => setState(INITIAL), []);
+  const showWelcome = useCallback(() => setState(WELCOME), []);
 
   /** 回到运行界面（例如点的是正在跑的那条历史），丢掉待续跑 */
   const focusRun = useCallback(() => setState({ ...INITIAL, welcome: false }), []);

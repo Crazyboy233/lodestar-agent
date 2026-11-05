@@ -16,6 +16,8 @@ interface Props {
   onNew: () => void;
   onOpenSettings: () => void;
   onSelect: (thread: string) => void;
+  /** 删一条历史；成功返回 null，失败返回要显示的错误文案 */
+  onDelete: (thread: string) => Promise<string | null>;
 }
 
 function IconPlus() {
@@ -38,11 +40,23 @@ function IconGear() {
   );
 }
 
+function IconTrash() {
+  return (
+    <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+      <path
+        d="M2.8 4.4h10.4M6.3 4.4V3h3.4v1.4M4.4 4.4l.6 8.4h6l.6-8.4M6.6 6.6v4.2M9.4 6.6v4.2"
+        stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"
+        strokeLinejoin="round" fill="none"
+      />
+    </svg>
+  );
+}
+
 const COLLAPSE_KEY = 'lodestar.collapsedProjects';
 
 export function Sidebar({
   projects, total, loading, error, selected, currentThread, busy, connected,
-  onNew, onOpenSettings, onSelect,
+  onNew, onOpenSettings, onSelect, onDelete,
 }: Props) {
   // 折叠状态记在本地：目录多了之后，用户不希望每次刷新都重新收一遍
   const [collapsed, setCollapsed] = useState<Set<string>>(() => {
@@ -69,6 +83,25 @@ export function Sidebar({
       else next.add(workdir);
       return next;
     });
+  };
+
+  // 删除是两步：先点垃圾桶把这一行切成确认条，再点「删除」才真的发请求。
+  // 不用 window.confirm：它会卡住整个标签页，而且和这套深色面板格格不入。
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [delError, setDelError] = useState('');
+
+  const askDelete = (thread: string) => {
+    setDelError('');
+    setConfirming(thread);
+  };
+
+  const doDelete = async (thread: string) => {
+    setDeleting(thread);
+    const fail = await onDelete(thread);
+    setDeleting(null);
+    setConfirming(null);
+    setDelError(fail || '');
   };
 
   return (
@@ -106,6 +139,7 @@ export function Sidebar({
         {!loading && projects.length === 0 && (
           <div className="side-empty">{error || '还没有运行记录'}</div>
         )}
+        {delError && <div className="side-err">{delError}</div>}
 
         {projects.map((project) => {
           const open = !collapsed.has(project.workdir);
@@ -128,8 +162,16 @@ export function Sidebar({
                     const state = running ? 'running' : item.state;
                     const stateText = running ? '运行中' : (STATE_TEXT[state] ?? state);
                     const goal = item.goal || item.thread;
+                    const asking = confirming === item.thread;
                     return (
-                      <li key={item.thread}>
+                      <li
+                        className="hi-row"
+                        key={item.thread}
+                        // 鼠标移开就撤销确认，免得一点就删的误触
+                        onMouseLeave={() => {
+                          if (asking && deleting !== item.thread) setConfirming(null);
+                        }}
+                      >
                         <button
                           className={`hi${selected === item.thread ? ' on' : ''}${running ? ' current' : ''}`}
                           onClick={() => onSelect(item.thread)}
@@ -141,6 +183,36 @@ export function Sidebar({
                             {state === 'done' ? timeAgo(item.started) : stateText}
                           </span>
                         </button>
+
+                        {/* 运行中那条不给删：图还挂在它的 thread 上 */}
+                        {!running && (asking ? (
+                          <div className="hi-confirm" role="group" aria-label="确认删除这条历史">
+                            <span className="hi-confirm-q">删掉这条历史？</span>
+                            <button
+                              className="hi-confirm-yes"
+                              disabled={deleting === item.thread}
+                              onClick={() => void doDelete(item.thread)}
+                            >
+                              {deleting === item.thread ? '删除中' : '删除'}
+                            </button>
+                            <button
+                              className="hi-confirm-no"
+                              disabled={deleting === item.thread}
+                              onClick={() => setConfirming(null)}
+                            >
+                              取消
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            className="hi-del"
+                            aria-label={`删除「${goal}」的历史`}
+                            title="删除这条任务历史（会话与断点一起删，之后不能续跑）"
+                            onClick={() => askDelete(item.thread)}
+                          >
+                            <IconTrash />
+                          </button>
+                        ))}
                       </li>
                     );
                   })}

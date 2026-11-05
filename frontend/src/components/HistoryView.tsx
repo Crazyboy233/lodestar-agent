@@ -8,12 +8,11 @@ interface Props {
   error: string;
   running: boolean;
   onResume: (item: HistoryDetail) => void;
-  onUseAsNew: (item: HistoryDetail) => void;
   onClose: () => void;
 }
 
 export function HistoryView({
-  detail, loading, error, running, onResume, onUseAsNew, onClose,
+  detail, loading, error, running, onResume, onClose,
 }: Props) {
   if (loading) {
     return <section className="hist-view"><div className="hist-empty">正在读取会话…</div></section>;
@@ -66,9 +65,6 @@ export function HistoryView({
             onClick={() => onResume(detail)}
           >
             继续这个会话
-          </button>
-          <button className="ghost" disabled={running} onClick={() => onUseAsNew(detail)}>
-            在此目录新建任务
           </button>
           {canResume
             ? <span className="hist-action-tip">先回到操作界面，在下方确认后才开始跑</span>

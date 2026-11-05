@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import type { ConfigView, HistoryDetail, RunMeta } from './types';
 import { EMPTY_META } from './types';
 import { command, fetchState, reportClient, runCommand } from './api';
@@ -19,6 +20,8 @@ import { NoteList } from './components/NoteList';
 import { QuitPanel } from './components/QuitPanel';
 import { ConfigDialog } from './components/ConfigDialog';
 import { HistoryView } from './components/HistoryView';
+import { pickLaunchLine } from './ui';
+import { withViewTransition } from './viewTransition';
 
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -30,13 +33,15 @@ export default function App() {
   const [meta, setMeta] = useState<RunMeta>(EMPTY_META);
   const [workdir, setWorkdir] = useState('');
   const [preset, setPreset] = useState<Preset | null>(null);
+  // 清屏页那一句开场白：进来先随机一句，每次点「新任务」再换一句
+  const [launchLine, setLaunchLine] = useState(() => pickLaunchLine());
   // 调试入口：?cfg=1 直接打开设置窗口
   const [cfgOpen, setCfgOpen] = useState(
     () => new URLSearchParams(location.search).has('cfg'),
   );
 
   const { applySnapshot, adopt, requestStop } = run;
-  const { refresh, load, clearDetail } = history;
+  const { refresh, load, clearDetail, remove: removeHistory } = history;
   const { runStarted, showWelcome, focusRun, openThread, closeThread } = ui;
   const prepareResumeUi = ui.prepareResume;
 
@@ -62,7 +67,11 @@ export default function App() {
     if (next !== 'idle') void refresh();
   }, [run.session.state, runStarted, refresh]);
 
-  useEffect(() => {
+  // data-view 决定主区域的布局模式（launch 居中 flex / run 两列 grid）。
+  // 必须用 layout effect：开跑和新建任务都包在视图过渡里，浏览器拍「新快照」是在
+  // flushSync 返回之前完成的；普通 effect 跑在那之后，快照会拍到旧的布局模式，
+  // 于是动画按旧结构演、结束时再跳一下。
+  useLayoutEffect(() => {
     document.body.dataset.view = ui.screen;
   }, [ui.screen]);
 
@@ -74,10 +83,16 @@ export default function App() {
       workdir: p.workdir,
     });
     if (!res.ok || !res.session) return res.error ?? '启动失败';
-    adopt(res.session);
-    if (res.session.workdir) setWorkdir(res.session.workdir);
+    const session = res.session;
+    // 开跑这一刻整块布局都换了（居中 → 底部 + 右侧抽屉），
+    // 一次提交里连带清掉欢迎态，再交给视图过渡补间：卡片沉底、抽屉滑出。
+    withViewTransition(() => flushSync(() => {
+      runStarted();
+      adopt(session);
+      if (session.workdir) setWorkdir(session.workdir);
+    }));
     return null;
-  }, [adopt]);
+  }, [adopt, runStarted]);
 
   const guide = useCallback(async (
     target: 'main' | 'worker', text: string,
@@ -100,9 +115,14 @@ export default function App() {
       verifierModel: models.verifier,
     });
     if (!res.ok || !res.session) return res.error ?? '续跑失败';
-    adopt(res.session);
+    const session = res.session;
+    // 续跑同样是一次布局切换；顺手清掉「待续跑」草稿，落定后直接是引导卡
+    withViewTransition(() => flushSync(() => {
+      runStarted();
+      adopt(session);
+    }));
     return null;
-  }, [adopt]);
+  }, [adopt, runStarted]);
 
   const openHistory = useCallback((thread: string) => {
     // 正在跑的这一条没有「只读历史」可看：它的界面就是当前操作界面
@@ -119,6 +139,15 @@ export default function App() {
     clearDetail();
   }, [closeThread, clearDetail]);
 
+  // 删掉一条历史：如果删的正是当前打开的那条，顺手把只读视图关掉，
+  // 否则页面会停在一个已经不存在的会话上（标题还在，正文没了）。
+  const deleteHistoryEntry = useCallback(async (thread: string): Promise<string | null> => {
+    const fail = await removeHistory(thread);
+    if (fail) return fail;
+    if (ui.thread === thread) closeHistory();
+    return null;
+  }, [removeHistory, ui.thread, closeHistory]);
+
   // 从历史「继续这个会话」= 回到操作界面挂成待续跑，真正开跑要再确认一次
   const prepareResume = useCallback((item: HistoryDetail) => {
     prepareResumeUi(item);
@@ -126,11 +155,18 @@ export default function App() {
   }, [prepareResumeUi, clearDetail]);
 
   const useAsNew = useCallback((item: HistoryDetail) => {
-    setPreset({ goal: item.goal, workdir: item.workdir, n: Date.now() });
-    showWelcome();
+    withViewTransition(() => flushSync(() => {
+      setPreset({ goal: item.goal, workdir: item.workdir, n: Date.now() });
+      showWelcome();
+    }));
   }, [showWelcome]);
 
-  const newTask = useCallback(() => showWelcome(), [showWelcome]);
+  const newTask = useCallback(() => {
+    withViewTransition(() => flushSync(() => {
+      setLaunchLine((prev) => pickLaunchLine(prev));
+      showWelcome();
+    }));
+  }, [showWelcome]);
 
   const onSaved = useCallback((cfg: ConfigView) => {
     setMeta((prev) => ({
@@ -160,6 +196,12 @@ export default function App() {
 
   const resumeDraft = ui.resume;
 
+  // 正常跑完就收起输入框：这时候没东西可输入了，再开新任务走左上角。
+  // 但挂着「继续这个会话」的待续跑草稿时不能收，否则连确认框一起藏掉了。
+  const showComposer = !(
+    ui.screen === 'run' && run.session.state === 'done' && !ui.resume
+  );
+
   return (
     <>
       <div className="app">
@@ -175,6 +217,7 @@ export default function App() {
           onNew={newTask}
           onOpenSettings={() => setCfgOpen(true)}
           onSelect={openHistory}
+          onDelete={deleteHistoryEntry}
         />
 
         <div className="main-col">
@@ -197,39 +240,37 @@ export default function App() {
                 error={history.detailError}
                 running={run.session.state === 'running'}
                 onResume={prepareResume}
-                onUseAsNew={useAsNew}
                 onClose={closeHistory}
               />
             ) : (
               <>
                 {ui.screen === 'launch' ? (
-                  <section className="stream-wrap welcome-wrap">
-                    <div className="welcome">
-                      <div className="welcome-mark">Lodestar</div>
-                      <p>给一个目标，主 agent 拆解 → worker 执行 → 独立验收。</p>
-                      <span>任务开始后，执行过程会打印在这里。</span>
-                    </div>
+                  // 新任务 = 清屏：只留一句开场白，下面是输入卡
+                  <section className="stream-wrap launch-blank">
+                    <p className="launch-line" key={launchLine}>{launchLine}</p>
                   </section>
                 ) : (
                   <Stream events={run.events} />
                 )}
 
-                <div className="composer-zone">
-                  <Composer
-                    variant={variant}
-                    meta={meta}
-                    defaultWorkdir={workdir || meta.workdir}
-                    currentModels={{
-                      worker: run.session.workerModel || meta.workerModel,
-                      verifier: run.session.verifierModel || meta.verifierModel,
-                    }}
-                    preset={preset}
-                    onStart={start}
-                    onGuide={guide}
-                    onResume={resume}
-                    onNewTask={() => resumeDraft && useAsNew(resumeDraft)}
-                  />
-                </div>
+                {showComposer && (
+                  <div className="composer-zone">
+                    <Composer
+                      variant={variant}
+                      meta={meta}
+                      defaultWorkdir={workdir || meta.workdir}
+                      currentModels={{
+                        worker: run.session.workerModel || meta.workerModel,
+                        verifier: run.session.verifierModel || meta.verifierModel,
+                      }}
+                      preset={preset}
+                      onStart={start}
+                      onGuide={guide}
+                      onResume={resume}
+                      onNewTask={() => resumeDraft && useAsNew(resumeDraft)}
+                    />
+                  </div>
+                )}
 
                 {/* 侧栏只在运行界面出现：欢迎页没有任务清单可看 */}
                 {ui.screen === 'run' && (
