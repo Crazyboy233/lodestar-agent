@@ -1,6 +1,6 @@
 """一次运行的执行体，以及「页面驱动」需要的会话包装。
 
-- `Console`     终端 + 页面双写（kind 决定页面上的标签与色条）
+- `Console`     终端 + 页面双写（把 view.Line 送到两个出口）
 - `run_session` 同步跑一次完整流程，返回退出码；CLI 和页面线程都走它
 - `Runner`      线程包装：页面提交目标 → 后台跑 → 可查询进度 / 可边界退出
 
@@ -23,13 +23,23 @@ from pathlib import Path
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from . import logfmt
+from .codes import ExitCode, session_state
 from .config import Config, load_config
 from .control import Control
-from .graph import AgentFailure, build_graph
+from .errors import AgentFailure
+from .graph import build_graph
 from .history import HistoryStore
+from .records import tasks_from_state
+from .view import Line, LogSink, Renderer
 from .worker import terminate_all_cli
 
-_DISPLAY_LIMIT = 1200
+# 页面在没有 runner（或还没开跑）时用的空会话，字段与 Runner._session 保持一致
+EMPTY_SESSION: dict = {
+    "goal": "", "thread": "", "state": "idle", "code": None,
+    "started": 0.0, "ended": 0.0, "error": "",
+    "workerModel": "", "verifierModel": "", "workdir": "",
+}
 
 
 def new_thread_id() -> str:
@@ -75,29 +85,36 @@ class Console:
     role 决定这一条属于哪一类内容，页面据此区分「节点收到的 prompt / 节点的输出 / 旁白日志」：
     prompt（模型调用真正收到的 prompt 原文）/ task（从结果里摘出的任务与验收）/
     output（节点产出）/ log（流程说明）/ guide（用户投递的引导）。
-
-    终端行为与改造前保持一致（分隔线、缩进、截断），页面拿到的内容更全（前端自己做折叠）。
     """
 
     def __init__(self, control: Control | None = None):
         self.control = control
 
+    def show(self, line: Line) -> None:
+        """展示一行视图（终端打印 + 页面事件）。日志去向由 LogSink 单独处理。"""
+        if not line.console:
+            return
+        if line.hr:
+            print(f"\n{logfmt.RULE}")
+            print(line.text)
+            print(logfmt.RULE)
+            if self.control:
+                self.control.emit(line.text, kind=line.kind, hr=True, role=line.role)
+            return
+        print(textwrap.indent(line.text, " " * line.indent) if line.indent else line.text)
+        if self.control:
+            self.control.emit(line.text, kind=line.kind, role=line.role)
+
     def hr(self, title: str = "", kind: str = "system") -> None:
-        line = "─" * 62
-        print(f"\n{line}")
+        """只有标题、随后要自己补内容时用；等价于 show(Line(..., hr=True))。"""
         if title:
-            print(title)
-            print(line)
-        if self.control and title:
-            # 章节标题 / 退出提示都是脚本写的流程旁白，不是模型说的话，统一归「旁白」
-            self.control.emit(title, kind=kind, hr=True, role="log")
+            self.show(Line(title, kind=kind, hr=True))
+        else:
+            print(f"\n{logfmt.RULE}")
 
     def say(self, body: str, kind: str = "system", indent: int = 2,
             role: str = "log") -> None:
-        body = "" if body is None else str(body)
-        print(textwrap.indent(body, " " * indent) if indent else body)
-        if self.control:
-            self.control.emit(body, kind=kind, role=role)
+        self.show(Line("" if body is None else str(body), kind=kind, role=role, indent=indent))
 
 
 def open_log():
@@ -111,69 +128,11 @@ def _w(logf, text: str) -> None:
     logf.flush()
 
 
-def _clip(text: str, limit: int = _DISPLAY_LIMIT) -> str:
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"…(已截断，共 {len(text)} 字)"
-
-
-def _task_status(record: dict) -> str:
-    if not record.get("verified", True):
-        return "skip"          # 跑了 worker 没来得及验收
-    return "pass" if record.get("passed") else "fail"
-
-
-def build_tasks(state: dict) -> list[dict]:
-    """把 state 摊成页面上的任务清单：已完成 + 当前 + 剩余。
-
-    已完成按任务文本去重（同一条被打回或重跑过只留最后一次），
-    否则清单里会出现好几条同名任务，看着像重复派工。
-    """
-    records = state.get("records") or []
-    latest: dict[str, dict] = {}
-    for r in records:
-        latest[str(r.get("task", ""))] = r
-
-    tasks: list[dict] = []
-    for r in latest.values():
-        tasks.append({
-            "task": r.get("task", ""),
-            "verify": r.get("verify", ""),
-            "status": _task_status(r),
-            "attempts": r.get("attempts", 1),
-            "duration": r.get("duration", 0.0),
-            "reason": r.get("reason", ""),
-        })
-
-    current = state.get("current")
-    if current:
-        tasks.append({
-            "task": current.get("task", ""),
-            "verify": current.get("verify", ""),
-            "status": "running",
-            "attempts": state.get("attempts", 0) or 1,
-            "duration": state.get("last_duration", 0.0),
-            "reason": "",
-        })
-
-    for item in state.get("plan") or []:
-        tasks.append({
-            "task": item.get("task", ""),
-            "verify": item.get("verify", ""),
-            "status": "pending",
-            "attempts": 0,
-            "duration": 0.0,
-            "reason": "",
-        })
-    return tasks
-
-
 class SessionError(RuntimeError):
     """这次运行起不来（线程冲突 / checkpoint 不存在 / 已跑完），不是流程本身失败。"""
 
 
-def _prepare_resume(app, run_config, cfg, thread_id: str, goal: str) -> tuple[str, str]:
+def _prepare_resume(app, run_config, thread_id: str, goal: str) -> tuple[str, str]:
     """处理续跑：把 checkpoint 收拾成「能继续跑」的样子。返回 (goal, 给用户看的提示)。
 
     三种接法对应 aborted_stage：worker 重跑、verify 直接补验收（不重跑 worker）、done 跳过。
@@ -246,22 +205,21 @@ def run_session(
     run_config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 120}
 
     logf = None
-    code = 0
+    code = int(ExitCode.OK)
     store = HistoryStore(cfg.root)
     hist_thread: str | None = None
     answer = ""
-    done = 0
-    failed = 0
     hist_error = ""
+    renderer = Renderer()
     try:
         resume_note = ""
         if resume:
             try:
-                goal, resume_note = _prepare_resume(app, run_config, cfg, thread_id, goal)
+                goal, resume_note = _prepare_resume(app, run_config, thread_id, goal)
             except SessionError as exc:
                 con.say(f"[续跑失败] {exc}", kind="stop")
                 print(f"[续跑失败] {exc}", file=sys.stderr)
-                return 2
+                return int(ExitCode.SETUP)
             if resume_note:
                 con.say(f"提示    : {resume_note}", kind="system")
         else:
@@ -273,7 +231,7 @@ def run_session(
                 )
                 con.say(f"[线程冲突] {msg}", kind="stop")
                 print(f"[线程冲突] {msg}", file=sys.stderr)
-                return 2
+                return int(ExitCode.SETUP)
 
         logf, log_path = open_log()
         # 历史记录在这里落盘：此时 goal 已按续跑规则修正过，workdir 也已定
@@ -283,45 +241,13 @@ def run_session(
             dry_run=dry_run, resume=resume, log_path=str(log_path),
         )
         hist_thread = thread_id
-        _w(logf, f"目标: {goal}")
-        _w(logf, f"thread: {thread_id}" + ("（续跑）" if resume else ""))
-        _w(logf, f"checkpoint: {db_path}")
-        if resume_note:
-            _w(logf, f"resume: {resume_note}")
-        _w(logf, f"主 agent: {cfg.main_agent.model} @ {cfg.main_agent.base_url}")
-        _w(logf, f"worker: {cfg.worker.cli} (model={cfg.worker.model or 'CLI 默认'}, "
-                f"tools={cfg.worker.allowed_tools}, cwd={cfg.worker.workdir}, "
-                f"max_turns={cfg.worker.max_turns or 'CLI 默认'})")
-        _w(logf, f"验收: {cfg.verifier.cli} (model={cfg.verifier.model or 'CLI 默认'}, "
-                f"tools={cfg.verifier.allowed_tools}, "
-                f"cwd={cfg.worker.workdir}/{cfg.verifier.scratch_dir}, "
-                f"max_rounds={cfg.verifier.max_rounds})")
-        _w(logf, "")
-
-        con.say(f"目标    : {goal}", kind="system", indent=0)
-        con.say(
-            f"主 agent: {cfg.main_agent.model} @ {cfg.main_agent.base_url}",
-            kind="system", indent=0,
-        )
-        con.say(
-            f"worker  : {cfg.worker.cli} (model={cfg.worker.model or 'CLI 默认'}, "
-            f"cwd={cfg.worker.workdir})",
-            kind="system", indent=0,
-        )
-        con.say(
-            f"验收    : {cfg.verifier.cli} (model={cfg.verifier.model or 'CLI 默认'}, "
-            f"max_rounds={cfg.verifier.max_rounds})",
-            kind="system", indent=0,
-        )
-        if dry_run:
-            con.say("模式    : dry-run（确定性决策代替主 agent，跳过验收）", kind="system", indent=0)
-        con.say(f"thread  : {thread_id}" + ("（续跑）" if resume else ""), kind="system", indent=0)
+        _write_header(logf, cfg, goal, thread_id, db_path, resume, resume_note, dry_run)
+        _say_header(con, cfg, goal, thread_id, resume, dry_run)
 
         control.set_stage("开始执行")
         # 先推一次：续跑时页面上要能立刻看到已有的任务记录
-        control.tasks_event(build_tasks(app.get_state(run_config).values or {}))
-        done = 0
-        current_task = ""
+        control.tasks_event(tasks_from_state(app.get_state(run_config).values or {}))
+        log_sink = LogSink(lambda text: _w(logf, text))
         initial = None if resume else {
             "goal": goal, "plan": [], "current": None,
             "attempts": 0, "feedback": "", "records": [],
@@ -330,157 +256,52 @@ def run_session(
         for chunk in app.stream(initial, run_config, stream_mode="updates"):
             for node, update in chunk.items():
                 update = update or {}
-                if node == "plan":
-                    if update.get("stage") == "abort":
-                        con.hr("[主 agent] 边界退出 → 收尾", kind="stop")
-                        if update.get("note"):
-                            con.say(update["note"], kind="stop")
-                        _w(logf, "=" * 70)
-                        _w(logf, "[主 agent] 边界退出")
-                        if update.get("note"):
-                            _w(logf, update["note"])
-                    elif update.get("stage") == "init":
-                        con.hr("[主 agent] 拆解任务方案", kind="plan")
-                        if update.get("note"):
-                            con.say(update["note"], kind="plan")
-                        items = ([update.get("current")] if update.get("current") else []) + (
-                            update.get("plan") or []
-                        )
-                        for i, item in enumerate(items, 1):
-                            if not item:
-                                continue
-                            con.say(f"{i}. {item['task']}", kind="plan", role="task")
-                            con.say(
-                                f"   验收: {item.get('verify') or '(未给出可执行标准，由验收 agent 自行设计)'}",
-                                kind="plan", role="task",
-                            )
-                        current_task = (update.get("current") or {}).get("task", "")
-                        _w(logf, "=" * 70)
-                        _w(logf, "[主 agent] 拆解任务方案")
-                        if update.get("note"):
-                            _w(logf, "note: " + update["note"])
-                        for i, item in enumerate(items, 1):
-                            if item:
-                                _w(logf, f"{i}. {item['task']}")
-                                _w(logf, f"   验收: {item.get('verify') or '(未给出)'}")
-                        if update.get("plan_raw"):
-                            _w(logf, "--- 模型原始输出 ---")
-                            _w(logf, update["plan_raw"])
-                    else:
-                        for r in update.get("records", []) or []:
-                            done += 1
-                            if not r.get("passed"):
-                                failed += 1
-                        action = update.get("action", "")
-                        label = "继续下一个" if action == "dispatch" else "收尾"
-                        con.hr(
-                            f"[主 agent] 动态规划 → {label}（完成 {done} 条 / 失败 {failed}）",
-                            kind="plan",
-                        )
-                        if update.get("note"):
-                            con.say(update["note"], kind="plan")
-                        _w(logf, "=" * 70)
-                        _w(logf, f"[主 agent] 动态规划 → {label}（完成 {done} 条 / 失败 {failed}）")
-                        if update.get("note"):
-                            _w(logf, "note: " + update["note"])
-                        if update.get("decision_raw"):
-                            _w(logf, "--- 模型原始输出 ---")
-                            _w(logf, update["decision_raw"])
-                        if action == "dispatch" and update.get("current"):
-                            current_task = update["current"].get("task", "")
-                elif node == "worker":
-                    if update.get("skipped"):
-                        con.hr(f"[worker] 已中止 · 这一轮未执行：{current_task}", kind="stop")
-                        _w(logf, "=" * 70)
-                        _w(logf, f"[worker] 已中止 · 这一轮未执行：{current_task}")
-                    else:
-                        con.hr(
-                            f"[worker] 执行  第 {done + 1} 条 · 第 {update.get('attempts', 1)} 轮"
-                            + ("（被中止）" if update.get("abort") else ""),
-                            kind="worker",
-                        )
-                        body = _clip(update.get("last_output") or update.get("last_error") or "")
-                        con.say(f"{update.get('last_duration', 0)}s\n{body or '(无输出)'}",
-                                kind="worker", role="output")
-                        _w(logf, "=" * 70)
-                        _w(logf, f"[worker] 执行 第 {done + 1} 条 第 {update.get('attempts', 1)} 轮"
-                                 f"（{update.get('last_duration', 0)}s）")
-                        _w(logf, f"任务: {current_task}")
-                        if update.get("last_output"):
-                            _w(logf, "输出:\n" + update["last_output"])
-                        if update.get("last_error"):
-                            _w(logf, "错误: " + update["last_error"])
-                elif node == "verify":
-                    if update.get("abort"):
-                        con.hr("[verifier] 超过等待上限，验收被强制终止", kind="stop")
-                        _w(logf, "=" * 70)
-                        _w(logf, "[verifier] 超过等待上限，验收被强制终止")
-                        continue
-                    if update.get("draining") and not update.get("verdict_ready"):
-                        con.hr("[verifier] 已跳过（收到退出请求，不再开始新的模型调用）",
-                               kind="stop")
-                        _w(logf, "=" * 70)
-                        _w(logf, "[verifier] 已跳过（收到退出请求）")
-                        continue
-                    passed = update.get("verdict_passed")
-                    con.hr(f"[verifier] 验收 → {'PASS' if passed else 'FAIL'}", kind="verifier")
-                    con.say(_clip(update.get("verdict_reason", "")) or "(无)", kind="verifier",
-                            role="output")
-                    _w(logf, "=" * 70)
-                    _w(logf, f"[verifier] 验收 → {'PASS' if passed else 'FAIL'}")
-                    _w(logf, "结论: " + update.get("verdict_reason", ""))
-                    if update.get("verdict_raw"):
-                        _w(logf, "--- 模型原始输出 ---")
-                        _w(logf, update["verdict_raw"])
-                elif node == "synthesize":
+                if node == "synthesize":
                     answer = update.get("answer", "")
+                for line in renderer.render(node, update):
+                    con.show(line)
+                    log_sink.write(line)
             # 每批节点更新后刷新任务清单：读 checkpoint 比从 update 里拼更准
             # （records 是累加的、current/plan 会被后续节点改写）
-            control.tasks_event(build_tasks(app.get_state(run_config).values or {}))
+            control.tasks_event(tasks_from_state(app.get_state(run_config).values or {}))
 
         final = app.get_state(run_config).values or {}
         drained = bool(final.get("abort") or final.get("draining"))
 
-        con.hr("[主 agent] 最终答复", kind="synth")
-        con.say(answer or "(空)", kind="synth", indent=0, role="output")
-        _w(logf, "=" * 70)
-        _w(logf, "[主 agent] 最终答复")
-        _w(logf, answer or "(空)")
-
         if drained:
             control.status("aborted", control.stop_reason)
             control.emit("已按边界退出：当前这一轮已完整结束，checkpoint 已保存", kind="stop")
-            code = 130
+            code = int(ExitCode.ABORTED)
         else:
-            control.status("failed" if failed else "done")
-            code = 1 if failed else 0
+            control.status("failed" if renderer.failed else "done")
+            code = int(ExitCode.FAILED) if renderer.failed else int(ExitCode.OK)
 
     except AgentFailure as exc:
         con.hr("[流程终止] 模型请求失败", kind="stop")
         con.say(f"失败节点: {exc.node}", kind="stop")
         con.say(f"可能原因: {exc.reason}", kind="stop")
         if logf:
-            _w(logf, "=" * 70)
+            _w(logf, logfmt.LOG_RULE)
             _w(logf, "[流程终止] 模型请求失败")
-            _w(logf, f"失败节点: {exc.node}")
-            _w(logf, f"可能原因: {exc.reason}")
+            _w(logf, logfmt.field("失败节点", exc.node))
+            _w(logf, logfmt.field("可能原因", exc.reason))
         control.status("failed", f"{exc.node}: {exc.reason}")
         control.emit(f"流程终止于 {exc.node}：{exc.reason}", kind="stop")
         hist_error = f"{exc.node}: {exc.reason}"
-        code = 3
+        code = int(ExitCode.FATAL)
     except KeyboardInterrupt:
         if logf:
             _w(logf, "\n[已中断]")
         control.status("aborted", "终端中断（Ctrl+C）")
         control.emit("已中断，checkpoint 保留", kind="stop")
         hist_error = "终端中断（Ctrl+C）"
-        code = 130
+        code = int(ExitCode.ABORTED)
     finally:
         if hist_thread:
             store.finish(
                 hist_thread, code,
                 answer=answer,
-                passed=max(0, done - failed), failed=failed,
+                passed=max(0, renderer.done - renderer.failed), failed=renderer.failed,
                 error=hist_error,
             )
         # 收尾必须落到「连接断开」这一层：只让 Python 退出，CLI 里的模型请求
@@ -495,10 +316,47 @@ def run_session(
             logf.close()
         conn.close()
 
-    if code == 130:
+    if code == ExitCode.ABORTED:
         con.say(f"可续跑: 在页面上填 thread「{thread_id}」并勾选续跑", kind="stop")
 
     return code
+
+
+def _write_header(logf, cfg: Config, goal: str, thread_id: str, db_path: Path,
+                  resume: bool, resume_note: str, dry_run: bool) -> None:
+    _w(logf, f"目标: {goal}")
+    _w(logf, f"thread: {thread_id}" + ("（续跑）" if resume else ""))
+    _w(logf, f"checkpoint: {db_path}")
+    if resume_note:
+        _w(logf, logfmt.field("resume", resume_note))
+    _w(logf, f"主 agent: {cfg.main_agent.model} @ {cfg.main_agent.base_url}")
+    _w(logf, f"worker: {cfg.worker.cli} (model={cfg.worker.model or 'CLI 默认'}, "
+             f"tools={cfg.worker.allowed_tools}, cwd={cfg.worker.workdir}, "
+             f"max_turns={cfg.worker.max_turns or 'CLI 默认'})")
+    _w(logf, f"验收: {cfg.verifier.cli} (model={cfg.verifier.model or 'CLI 默认'}, "
+             f"tools={cfg.verifier.allowed_tools}, "
+             f"cwd={cfg.worker.workdir}/{cfg.verifier.scratch_dir}, "
+             f"max_rounds={cfg.verifier.max_rounds})")
+    _w(logf, "")
+
+
+def _say_header(con: Console, cfg: Config, goal: str, thread_id: str,
+                resume: bool, dry_run: bool) -> None:
+    con.say(f"目标    : {goal}", indent=0)
+    con.say(f"主 agent: {cfg.main_agent.model} @ {cfg.main_agent.base_url}", indent=0)
+    con.say(
+        f"worker  : {cfg.worker.cli} (model={cfg.worker.model or 'CLI 默认'}, "
+        f"cwd={cfg.worker.workdir})",
+        indent=0,
+    )
+    con.say(
+        f"验收    : {cfg.verifier.cli} (model={cfg.verifier.model or 'CLI 默认'}, "
+        f"max_rounds={cfg.verifier.max_rounds})",
+        indent=0,
+    )
+    if dry_run:
+        con.say("模式    : dry-run（确定性决策代替主 agent，跳过验收）", indent=0)
+    con.say(f"thread  : {thread_id}" + ("（续跑）" if resume else ""), indent=0)
 
 
 class Runner:
@@ -519,11 +377,7 @@ class Runner:
         self._thread: threading.Thread | None = None
         # 配置里的默认产出目录；页面每次不指定时就回到这里，避免上一次的选择长期粘住
         self._base_workdir = Path(cfg.worker.workdir)
-        self._session: dict = {
-            "goal": "", "thread": "", "state": "idle",
-            "code": None, "started": 0.0, "ended": 0.0, "error": "",
-            "workerModel": "", "verifierModel": "", "workdir": str(cfg.worker.workdir),
-        }
+        self._session: dict = dict(EMPTY_SESSION, workdir=str(cfg.worker.workdir))
 
     # ── 查询 ──────────────────────────────────────────────
     @property
@@ -553,13 +407,14 @@ class Runner:
             # 开跑前的引导必须在这里补投：reset 刚把信箱清空，
             # 而线程一旦启动就可能立刻进入第一个节点去取。
             self.control.push_notes(req.seed_notes)
-            self._session = {
-                "goal": req.goal, "thread": tid, "state": "running",
-                "code": None, "started": time.time(), "ended": 0.0, "error": "",
-                "workerModel": self.cfg.worker.model,
-                "verifierModel": self.cfg.verifier.model,
-                "workdir": str(self.cfg.worker.workdir),
-            }
+            self._session = dict(
+                EMPTY_SESSION,
+                goal=req.goal, thread=tid, state="running",
+                started=time.time(),
+                workerModel=self.cfg.worker.model,
+                verifierModel=self.cfg.verifier.model,
+                workdir=str(self.cfg.worker.workdir),
+            )
             info = dict(self._session)
             self._thread = threading.Thread(
                 target=self._body, args=(req.goal, tid, req.resume),
@@ -587,7 +442,7 @@ class Runner:
         return path.resolve()
 
     def _body(self, goal: str, thread_id: str, resume: bool) -> None:
-        code = 2
+        code = int(ExitCode.SETUP)
         err = ""
         try:
             code = run_session(
@@ -596,12 +451,10 @@ class Runner:
             )
         except BaseException as exc:  # noqa: BLE001 - 线程里不能把异常丢了
             err = f"{type(exc).__name__}: {exc}"
-            code = 2
+            code = int(ExitCode.SETUP)
             self.control.emit(f"运行异常：{err}", kind="stop")
         finally:
-            state = {
-                0: "done", 1: "failed", 2: "error", 3: "failed", 130: "aborted",
-            }.get(code, "failed")
+            state = session_state(code)
             with self._lock:
                 self._session.update(
                     state=state, code=code, ended=time.time(), error=err

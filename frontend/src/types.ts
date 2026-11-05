@@ -150,8 +150,6 @@ export interface RunMeta {
 
 /** GET /state 的快照：Status 的超集 */
 export interface StateSnapshot extends Status {
-  host: string;
-  port: number;
   meta: RunMeta;
   session: Session;
   /** 当前生效的产出目录（每次运行可以不同） */

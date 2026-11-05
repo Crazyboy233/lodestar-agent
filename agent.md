@@ -69,10 +69,10 @@ START → plan ─┬─ dispatch ─► worker → verify ─┐
 
 ### 4.4 失败与终止
 
-- 主 agent 的 `llm.invoke` 统一走 `_call_llm`：指数退避重试，耗尽抛 `AgentFailure(node, reason)`。
+- 主 agent 的模型调用统一走 `llm.call_llm`：指数退避重试，耗尽抛 `AgentFailure(node, reason)`。
 - worker 执行失败重试耗尽，在 `plan` 节点抛 `AgentFailure("worker(执行)", ...)`。
 - `__main__` 捕获 `AgentFailure` → 打印 `[流程终止] 模型请求失败` + 失败节点 + 可能原因，退出码 3。
-- `_explain` 把 429 / 超时 / 401 / 连接 / 5xx 映射成中文原因。
+- `llm.explain` 把 429 / 超时 / 401 / 连接 / 5xx 映射成中文原因。
 
 ### 4.5 checkpoint 与续跑
 
@@ -105,7 +105,7 @@ START → plan ─┬─ dispatch ─► worker → verify ─┐
 - 两个信箱：`main` / `worker`。`push_note` 入队，`take_notes` 消费即清空（投一次生效一次）。
 - 消费点固定在节点边界：`worker_node` 在启动 CLI **之前**取（拼进 `WORKER_PROMPT` 的 guidance 段）；`plan_node` 在调模型**之前**取（拼进 PLAN_INIT / PLAN_ROUND 的 guidance 段）。
 - 所以 worker 跑到一半时投递，会等它这一轮结束、下一次被调用才生效。这不是妥协 —— `codebuddy -p` 的 stdin 已关闭，本来就没有中途注入通道。
-- 引导只改 prompt 文本，不改变循环控制；`_sanitize_verify` 等闸门照旧生效。
+- 引导只改 prompt 文本，不改变循环控制；`parsing.sanitize_verify` 等闸门照旧生效。
 
 **边界退出（不是中断）**
 
@@ -128,7 +128,7 @@ START → plan ─┬─ dispatch ─► worker → verify ─┐
 1. `_terminate_tree` 的 pgid 用 `proc.pid`（`start_new_session=True` 保证它是 leader），不用 `os.getpgid` —— 后者在进程刚退出时抛 `ProcessLookupError`，那条分支只 kill 主进程，会漏掉组里还活着的孙进程。
 2. SIGTERM 之后**无论主进程退没退**，都再对整组补一次 SIGKILL：主进程死了不代表孙进程死了。
 3. stdout/stderr 落文件而不是管道，**不再需要 `communicate()` 的收尾超时**：孙进程攥着管道、无超时读取会永久阻塞的那个坑，从根上消失了。被强杀后直接读文件，能拿到中断前的产出。
-4. 主 agent 走 `llm.stream()`（`_invoke_interruptible`），到点 `gen.close()` 断连；非流式做不到真正停止生成。`_call_llm` 遇到 `ModelAborted` 不重试。
+4. 主 agent 走 `llm.stream()`（`llm.invoke_interruptible`），到点 `gen.close()` 断连；非流式做不到真正停止生成。`llm.call_llm` 遇到 `ModelAborted` 不重试。
 
 另外 `drain_deadline` 必须传**回调**而不是常量：退出请求通常发生在 CLI 已经跑起来之后，进入 `run_cli` 时还求不出来；传死值会让强杀分支永远不触发。
 
@@ -160,7 +160,7 @@ START → plan ─┬─ dispatch ─► worker → verify ─┐
 - **产出目录**：`run` 可带 `workdir`（绝对路径或相对项目根），`Runner._resolve_workdir()` 展开、按需 `mkdir`，再改 `cfg.worker.workdir`。`/state` 的 `workdir` 是当前生效值；不传或传空串时回到配置里的默认目录，避免上一次的选择长期粘住。
 - **目录选择**：`POST /command {"type":"pickdir"}` 由 `fspick.py` 在后端所在机器弹系统选择器（macOS `osascript`、Windows PowerShell `FolderBrowserDialog`、Linux `zenity`/`kdialog`），返回绝对路径或 `canceled`。浏览器拿不到本地绝对路径（File System Access API 只有 handle），所以必须由本机进程代劳；同步子进程放 `asyncio.to_thread`，并用全局锁防止叠出多个弹窗。
 - **历史与项目分组**：`HistoryStore`（`history.py`）在每次 run 开始时写 `history.json`（thread / goal / workdir / 模型 / 状态），结束时补退出码、耗时、最终答复。`GET /history` 用 `groups()` 按 workdir 分组：一个目录就是一个项目，组内按时间倒序。json 里没有的老 thread 从 `checkpoints.sqlite` 回填一次（用 uuid6 checkpoint_id 还原时间）。`GET /history/{thread}` 返回详情：任务清单由 checkpoint 的 `records` 映射，`resumable` 由 `abort / draining / last_error / pending_writes` 判断 —— 边界退出、执行失败、写了一半的线程可续，正常跑完的不可续（`next` 不在 checkpoint 里，是按图即时算的，不能直接读）。
-- **任务清单**：`build_tasks(state)` 把 `records` + `current` + `plan` 摊成一张列表，每个 chunk 后推一条 `tasks` 事件。`records` 按 task 文本去重（同一条被打回或重跑只留最后一次），状态映射 `pass / fail / skip / running / pending`。用 `app.get_state()` 读而不是从 `update` 拼 —— `records` 是 `operator.add` 累积的，`current` 会被后续节点改写。
+- **任务清单**：`records.tasks_from_state(state)` 把 `records` + `current` + `plan` 摊成一张列表，每个 chunk 后推一条 `tasks` 事件。`records` 按 task 文本去重（同一条被打回或重跑只留最后一次），状态映射 `pass / fail / skip / running / pending`。用 `app.get_state()` 读而不是从 `update` 拼 —— `records` 是 `operator.add` 累积的，`current` 会被后续节点改写。
 - **配置面板**：`GET /config` 返回 `as_editable(cfg)`（api_key 只给掩码 + `api_key_set`）；`POST /command {"type":"config"}` 经 `collect_overrides()` 走 `EDITABLE` 白名单 + 类型/范围校验，写进 `config.local.yaml`，再 `runner.reload_config()` 重新 load。运行中拒绝（409）。掩码不参与回写：前端 api_key 输入框留空，后端判断「空或等于掩码」就跳过这个字段，不会把掩码写进配置。
 
 **前端**
@@ -183,7 +183,7 @@ React 19 + TypeScript + Vite，源码在 `frontend/`，构建产物写进 `lodes
 
 | 节点 | 打点位置 | model 取值 |
 | --- | --- | --- |
-| `plan` / `synth` | `build_graph._ask()` 包住主 agent 的 `_call_llm` | `main_agent.model` |
+| `plan` / `synth` | `nodes.Nodes._ask()` 包住 `llm.call_llm` | `main_agent.model` |
 | `worker` | `worker_node` 启动 CLI 前 | `worker.cli` basename + `worker.model` |
 | `verifier` | `verify_node` 启动验收前 | `verifier.cli` basename + `verifier.model` |
 
@@ -214,9 +214,18 @@ key 放 `config.local.yaml`（已 gitignore），`config.yaml` 留空。
 
 ```
 lodestar_agent/
-  config.py      配置加载（config.local.yaml 覆盖 + 环境变量兜底）
-  graph.py       状态机（plan / worker / verify / synthesize）
-  worker.py      CLI 调用层：run_cli / run_worker / run_verifier（可取消、可注入引导）
+  config.py      配置加载（config.local.yaml 覆盖 + 环境变量兜底；默认值只在 dataclass 一处）
+  graph.py       图的装配：State + 四个节点的连接
+  nodes.py       节点逻辑：plan（动态规划）/ worker / verify / synth
+  prompts.py     所有 prompt 模板 + 引导 / 进度片段
+  records.py     任务记录：构造、去重、摊平成页面清单
+  parsing.py     模型输出解析 + 验收闸门 + 文本裁剪
+  llm.py         主 agent 调用：可中断流式 + 重试 + 错误归类
+  view.py        节点产出 → 展示行（终端 / 页面 / 日志）
+  logfmt.py      日志格式契约（写入端与回读解析共用）
+  codes.py       退出码 → 会话状态
+  errors.py      AgentFailure / ModelAborted
+  worker.py      CLI 调用层：CliOptions + run_cli / run_worker / run_verifier
   control.py     控制面：引导信箱 + 边界退出标志 + 事件总线
   session.py     执行体：Console / run_session / Runner（页面驱动）
   history.py     运行历史：history.json 读写 / 按产出目录分组 / 旧 checkpoint 回填

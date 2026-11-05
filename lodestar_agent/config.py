@@ -108,6 +108,78 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
+def _text(value) -> str:
+    return str(value)
+
+
+def _text_or(default: str):
+    """空串 / 缺失都回到默认值（`cli: ""` 这类写法在 yaml 里很常见）。"""
+    return lambda value: str(value) or default
+
+
+def _number(value) -> float:
+    return float(value)
+
+
+def _int_at_least(low: int, high: int | None = None):
+    def convert(value) -> int:
+        num = int(float(value))
+        if high is not None:
+            return max(low, min(high, num))
+        return max(low, num)
+    return convert
+
+
+def _flag(value) -> bool:
+    return bool(value)
+
+
+def _relative_path(root: Path):
+    def convert(value) -> Path:
+        path = Path(str(value or "./workspace")).expanduser()
+        return path if path.is_absolute() else (root / path).resolve()
+    return convert
+
+
+def _relative_paths(root: Path):
+    def convert(value) -> list[Path]:
+        items = value if isinstance(value, list) else [value]
+        out: list[Path] = []
+        for item in items:
+            if not item:
+                continue
+            path = Path(str(item)).expanduser()
+            out.append(path if path.is_absolute() else (root / path).resolve())
+        return out
+    return convert
+
+
+def _env_map(value) -> dict[str, str]:
+    return {str(k): str(v) for k, v in (value or {}).items()}
+
+
+def _model_list(value) -> list[str]:
+    return [str(m) for m in value] if isinstance(value, list) and value else list(CLI_MODELS)
+
+
+def _pick(raw: dict, rules: dict) -> dict:
+    """只取 raw 里**出现过**的字段，其余交给 dataclass 默认值。
+
+    这样默认值只有一处来源（dataclass 字段），不必在 load 里再抄一遍常量 ——
+    以前 `timeout_seconds = 600.0` 和 `raw.get("timeout_seconds", 600)` 是两条
+    独立来源，改一处容易只改一边。
+    """
+    out: dict = {}
+    for name, convert in rules.items():
+        if name not in raw:
+            continue
+        value = raw[name]
+        if value is None:      # 显式 null 也按「没配」处理
+            continue
+        out[name] = convert(value)
+    return out
+
+
 def load_config(path: str | Path = "config.yaml") -> Config:
     path = Path(path).expanduser().resolve()
     if not path.exists():
@@ -120,63 +192,55 @@ def load_config(path: str | Path = "config.yaml") -> Config:
     if local.exists():
         raw = _deep_merge(raw, yaml.safe_load(local.read_text(encoding="utf-8")) or {})
 
+    root = path.parent
     main_raw = raw.get("main_agent") or {}
     worker_raw = raw.get("worker") or {}
-    root = path.parent
-
-    main = MainAgentConfig(
-        base_url=str(main_raw.get("base_url") or "https://api.deepseek.com/v1"),
-        api_key=str(main_raw.get("api_key") or os.getenv("DEEPSEEK_API_KEY") or ""),
-        model=str(main_raw.get("model") or "deepseek-chat"),
-        temperature=float(main_raw.get("temperature", 0.2)),
-        max_retries=max(0, int(main_raw.get("max_retries", 3))),
-        plan_retries=max(0, int(main_raw.get("plan_retries", 2))),
-    )
-
-    workdir = Path(worker_raw.get("workdir") or "./workspace").expanduser()
-    if not workdir.is_absolute():
-        workdir = (root / workdir).resolve()
-
-    add_dirs = []
-    for d in worker_raw.get("add_dirs") or []:
-        p = Path(d).expanduser()
-        add_dirs.append(p if p.is_absolute() else (root / p).resolve())
-
-    worker = WorkerConfig(
-        cli=str(worker_raw.get("cli") or "codebuddy"),
-        model=str(worker_raw.get("model") or ""),
-        workdir=workdir,
-        timeout_seconds=float(worker_raw.get("timeout_seconds", 600)),
-        allowed_tools=str(worker_raw.get("allowed_tools") or "Read,Write,Edit,Bash"),
-        add_dirs=add_dirs,
-        env={str(k): str(v) for k, v in (worker_raw.get("env") or {}).items()},
-        max_turns=int(worker_raw.get("max_turns", 0) or 0),
-        max_retries=max(0, int(worker_raw.get("max_retries", 2))),
-    )
-
     verifier_raw = raw.get("verifier") or {}
-    verifier = VerifierConfig(
-        cli=str(verifier_raw.get("cli") or worker.cli),
-        model=str(verifier_raw.get("model") or ""),
-        timeout_seconds=float(verifier_raw.get("timeout_seconds", 180)),
-        # 验收 agent 要自己写 test 脚本，所以默认给 Write；被测目录只读，脚本写到 scratch_dir
-        allowed_tools=str(verifier_raw.get("allowed_tools") or "Read,Write,Bash"),
-        scratch_dir=str(verifier_raw.get("scratch_dir") or ".verify"),
-        max_rounds=max(1, int(verifier_raw.get("max_rounds", 3))),
-        max_retries=max(0, int(verifier_raw.get("max_retries", 2))),
-        env={str(k): str(v) for k, v in (verifier_raw.get("env") or {}).items()},
-    )
-
     ui_raw = raw.get("ui") or {}
-    models = ui_raw.get("models")
-    ui = UiConfig(
-        web=bool(ui_raw.get("web", False)),
-        host=str(ui_raw.get("host") or "127.0.0.1"),
-        port=int(ui_raw.get("port", 8788)),
-        drain_timeout_seconds=max(0.0, float(ui_raw.get("drain_timeout_seconds", 120))),
-        models=[str(m) for m in models] if isinstance(models, list) and models
-        else list(CLI_MODELS),
-    )
+
+    main = MainAgentConfig(**_pick(main_raw, {
+        "base_url": _text_or("https://api.deepseek.com/v1"),
+        "api_key": _text,
+        "model": _text_or("deepseek-chat"),
+        "temperature": _number,
+        "max_retries": _int_at_least(0),
+        "plan_retries": _int_at_least(0),
+    }))
+    # key 也可以只放在环境变量里
+    if not main.api_key:
+        main.api_key = os.getenv("DEEPSEEK_API_KEY") or ""
+
+    worker = WorkerConfig(**_pick(worker_raw, {
+        "cli": _text_or("codebuddy"),
+        "model": _text,
+        "workdir": _relative_path(root),
+        "timeout_seconds": _number,
+        "allowed_tools": _text_or("Read,Write,Edit,Bash"),
+        "add_dirs": _relative_paths(root),
+        "env": _env_map,
+        "max_turns": _int_at_least(0),
+        "max_retries": _int_at_least(0),
+    }))
+
+    verifier = VerifierConfig(**_pick(verifier_raw, {
+        # 验收 agent 要自己写 test 脚本，所以默认给 Write；被测目录只读，脚本写到 scratch_dir
+        "cli": _text_or(worker.cli),
+        "model": _text,
+        "timeout_seconds": _number,
+        "allowed_tools": _text_or("Read,Write,Bash"),
+        "scratch_dir": _text_or(".verify"),
+        "max_rounds": _int_at_least(1),
+        "max_retries": _int_at_least(0),
+        "env": _env_map,
+    }))
+
+    ui = UiConfig(**_pick(ui_raw, {
+        "web": _flag,
+        "host": _text_or("127.0.0.1"),
+        "port": lambda v: int(v),
+        "drain_timeout_seconds": lambda v: max(0.0, float(v)),
+        "models": _model_list,
+    }))
 
     return Config(main_agent=main, worker=worker, verifier=verifier, ui=ui, root=root)
 

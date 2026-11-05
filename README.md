@@ -181,15 +181,24 @@ uv run python -m lodestar_agent --thread-id fix-fib --resume   # 中断/失败�
 | 文件 | 作用 |
 | --- | --- |
 | `config.yaml` | 唯一配置入口：主模型 / worker / 验收 / 控制台 |
-| `lodestar_agent/config.py` | 读配置，支持 `config.local.yaml` 覆盖与环境变量兜底 |
-| `lodestar_agent/graph.py` | 状态机：`plan(动态) → worker → verify → 循环回 plan → synthesize` |
+| `lodestar_agent/config.py` | 读配置，支持 `config.local.yaml` 覆盖与环境变量兜底；默认值只在 dataclass 里写一遍 |
+| `lodestar_agent/graph.py` | 图的装配：`State` + 把四个节点连成 `plan → worker → verify → plan → synthesize` |
+| `lodestar_agent/nodes.py` | 四个节点的逻辑：`plan`（动态规划）/ `worker` / `verify` / `synth` |
+| `lodestar_agent/prompts.py` | 所有 prompt 模板，以及「引导」「进度」两段可插拔片段 |
+| `lodestar_agent/records.py` | 任务记录的构造与投影（record → 页面清单 / 历史详情） |
+| `lodestar_agent/parsing.py` | 模型输出解析（JSON 抠取）+ 验收标准闸门 + 文本裁剪 |
+| `lodestar_agent/llm.py` | 主 agent 的模型调用：可中断流式 + 退避重试 + 错误归类 |
+| `lodestar_agent/view.py` | 节点产出 → 展示行（终端 / 页面 / 日志三个出口） |
+| `lodestar_agent/logfmt.py` | 日志格式契约：写入端与「回看历史」解析端共用同一份常量 |
+| `lodestar_agent/codes.py` | 退出码 → 会话状态的唯一映射 |
+| `lodestar_agent/errors.py` | `AgentFailure`（终止流程）/ `ModelAborted`（主动断开） |
 | `lodestar_agent/session.py` | 执行体：`Console`（终端+页面双写）、`run_session`、`Runner`（线程包装） |
-| `lodestar_agent/worker.py` | CLI 调用层：`run_cli` / `run_worker` / `run_verifier`（可取消、可注入引导） |
+| `lodestar_agent/worker.py` | CLI 调用层：`CliOptions` + `run_cli` / `run_worker` / `run_verifier`（可取消、可注入引导） |
 | `lodestar_agent/control.py` | 控制面：引导信箱、停止标志、事件总线（SSE 源） |
 | `lodestar_agent/history.py` | 运行历史：`history.json` 读写、按产出目录分组、旧 checkpoint 回填 |
 | `lodestar_agent/fspick.py` | 系统文件夹选择器：osascript / PowerShell / zenity / kdialog |
 | `lodestar_agent/server.py` | FastAPI + uvicorn：JSON 接口、SSE、静态托管（不含页面内容） |
-| `lodestar_agent/__main__.py` | 命令行入口：逐节点打印、写日志、管 checkpoint、起控制台 |
+| `lodestar_agent/__main__.py` | 命令行入口：参数、模式选择（CLI 同步 / 页面驱动） |
 | `frontend/src/` | React + TS 源码。状态集中在 `hooks/`（`useUiMode` 管屏幕与输入区形态、`useRunSession` 管运行态与 SSE、`useHistory` 管历史），`App.tsx` 只做接线 |
 | `lodestar_agent/static/` | 前端构建产物（Vite 输出，勿手改） |
 | `history.json` | 运行历史（gitignore），按产出目录分组，最多 300 条 |

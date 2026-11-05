@@ -15,25 +15,20 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
+
+from . import logfmt
+from .codes import session_state
+from .records import dedupe, task_item
 
 _MAX_ITEMS = 300
 _FILE_NAME = "history.json"
 
 # UUIDv6 的时间戳从 1582-10-15 起算，单位 100ns
 _UUID_EPOCH = 0x01B21DD213814000
-
-_STATE_BY_CODE = {
-    0: "done",
-    1: "failed",
-    2: "error",
-    3: "failed",
-    130: "aborted",
-}
 
 
 def uuid_time(checkpoint_id: str) -> float:
@@ -58,36 +53,58 @@ def _ro_uri(path: Path) -> str:
     return path.expanduser().resolve().as_uri() + "?mode=ro"
 
 
-def read_checkpoint(db_path: Path, thread: str) -> dict:
-    """读一个 thread 的最新 state。失败一律返回空，历史列表不能因为读盘出错而挂掉。"""
-    if not db_path.exists():
+def _snap_values(tup) -> dict:
+    """把一个 checkpoint tuple 收敛成页面需要的那几个字段。"""
+    values = (tup.checkpoint or {}).get("channel_values") or {}
+    return {
+        "goal": str(values.get("goal") or ""),
+        "answer": str(values.get("answer") or ""),
+        "records": list(values.get("records") or []),
+        "pending": list(values.get("plan") or []),
+        "current": values.get("current") or {},
+        # 边界退出的线程会正常走到 END（next 为空），只能靠状态标记判断能不能续；
+        # 执行失败留下的 last_error / 未完成写入同样说明还有活没干完。
+        "abort": bool(values.get("abort")),
+        "draining": bool(values.get("draining")),
+        "last_error": str(values.get("last_error") or ""),
+        "has_pending": bool(tup.pending_writes),
+    }
+
+
+def _read_snaps(db_path: Path, threads: list[str]) -> dict[str, dict]:
+    """一次连接读完多个 thread。
+
+    以前 `_merged` 给每条「json 里没有的老记录」单独开一次 sqlite + SqliteSaver，
+    300 条历史就是一个页面请求开 300 次库。这里复用同一个连接。
+    """
+    if not db_path.exists() or not threads:
         return {}
     try:
         conn = sqlite3.connect(_ro_uri(db_path), uri=True, check_same_thread=False)
-        try:
-            from langgraph.checkpoint.sqlite import SqliteSaver
+    except sqlite3.Error:
+        return {}
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
 
-            tup = SqliteSaver(conn).get_tuple({"configurable": {"thread_id": thread}})
-            if tup is None:
-                return {}
-            values = (tup.checkpoint or {}).get("channel_values") or {}
-            return {
-                "goal": str(values.get("goal") or ""),
-                "answer": str(values.get("answer") or ""),
-                "records": list(values.get("records") or []),
-                "pending": list(values.get("plan") or []),
-                "current": values.get("current") or {},
-                # 边界退出的线程会正常走到 END（next 为空），只能靠状态标记判断能不能续；
-                # 执行失败留下的 last_error / 未完成写入同样说明还有活没干完。
-                "abort": bool(values.get("abort")),
-                "draining": bool(values.get("draining")),
-                "last_error": str(values.get("last_error") or ""),
-                "has_pending": bool(tup.pending_writes),
-            }
-        finally:
-            conn.close()
+        saver = SqliteSaver(conn)
+        out: dict[str, dict] = {}
+        for thread in threads:
+            try:
+                tup = saver.get_tuple({"configurable": {"thread_id": thread}})
+            except Exception:  # noqa: BLE001 - 单条读失败不影响其它记录
+                continue
+            if tup is not None:
+                out[thread] = _snap_values(tup)
+        return out
     except Exception:  # noqa: BLE001 - 读历史失败不该影响页面
         return {}
+    finally:
+        conn.close()
+
+
+def read_checkpoint(db_path: Path, thread: str) -> dict:
+    """读一个 thread 的最新 state。失败一律返回空，历史列表不能因为读盘出错而挂掉。"""
+    return _read_snaps(db_path, [thread]).get(thread, {})
 
 
 def drop_checkpoints(db_path: Path, thread: str) -> bool:
@@ -229,7 +246,7 @@ class HistoryStore:
         error: str = "",
     ) -> None:
         now = time.time()
-        state = _STATE_BY_CODE.get(code if code is not None else 2, "error")
+        state = session_state(code)
         with self._lock:
             data = self._read()
             item = next((x for x in data.get("items", []) if x.get("thread") == thread), None)
@@ -289,11 +306,11 @@ class HistoryStore:
     def _merged(self, db_path: Path) -> list[dict]:
         """json 的记录 + checkpoint 里还没被记录过的老 thread。"""
         items = {x.get("thread"): dict(x) for x in self.items() if x.get("thread")}
-        for old in _scan_checkpoints(db_path):
+        unknown = [o for o in _scan_checkpoints(db_path) if o["thread"] not in items]
+        snaps = _read_snaps(db_path, [o["thread"] for o in unknown])
+        for old in unknown:
             tid = old["thread"]
-            if tid in items:
-                continue
-            snap = read_checkpoint(db_path, tid)
+            snap = snaps.get(tid)
             if not snap:
                 continue
             records = snap.get("records") or []
@@ -386,18 +403,7 @@ class HistoryStore:
                     or snap.get("has_pending") or snap.get("last_error")
                 )
                 records = snap.get("records") or []
-                latest: dict[str, dict] = {}
-                for r in records:
-                    latest[str(r.get("task", ""))] = r
-                out["tasks"] = [{
-                    "task": r.get("task", ""),
-                    "verify": r.get("verify", ""),
-                    "status": ("pass" if r.get("passed") else "fail")
-                    if r.get("verified", True) else "skip",
-                    "attempts": r.get("attempts", 1),
-                    "duration": r.get("duration", 0.0),
-                    "reason": r.get("reason", ""),
-                } for r in latest.values()]
+                out["tasks"] = [task_item(r) for r in dedupe(records)]
             return out
         return None
 
@@ -416,31 +422,10 @@ class HistoryStore:
 # 运行页的事件流样式，就得把它切回「一条一条的事件」：分隔线当段落边界丢掉，
 # `[主 agent] …` 这种行是章节标题（hr），`任务:` / `--- 模型原始输出 ---` 之后的
 # 内容按 task / output 归类，其余是旁白 —— 和实时事件的 role 语义对齐。
+#
+# 这些标记在 logfmt.py 里定义，写入端（view.LogSink / session）用的是同一份常量。
 
-_LOG_SECTION = re.compile(r"^\[([^\]]{1,20})\]\s*(.*)$")
-_LOG_NUMBERED = re.compile(r"^\d+\.\s+")
-_LOG_RAW_MARK = "--- 模型原始输出 ---"
-# 行首前缀 → 这一块的 role（要带冒号，避免正文里恰好以「任务」开头的句子误判）
-_LOG_ROLE_START = (
-    ("任务:", "task"),
-    ("验收:", "task"),
-    ("输出:", "output"),
-    ("结论:", "output"),
-    ("错误:", "output"),
-    ("note:", "log"),
-)
-_LOG_KIND_BY_TAG = {"主 agent": "plan", "worker": "worker", "verifier": "verifier"}
-_LOG_STOP_TAGS = {"流程终止", "已中断", "收尾", "续跑失败", "线程冲突"}
 _MAX_EVENTS = 2000
-
-
-def _is_rule(line: str) -> bool:
-    """`======` 分隔线（终端里画的那种）。"""
-    return len(line) >= 10 and set(line) == {"="}
-
-
-def _kind_of(tag: str, current: str) -> str:
-    return _LOG_KIND_BY_TAG.get(tag) or ("stop" if tag in _LOG_STOP_TAGS else current)
 
 
 def parse_log(text: str, limit: int = _MAX_EVENTS) -> list[dict]:
@@ -449,7 +434,7 @@ def parse_log(text: str, limit: int = _MAX_EVENTS) -> list[dict]:
     ts 全是 0：文本日志没有时间轴，页面据此不显示时钟列，而不是编一个假时间。
     """
     lines = text.splitlines()
-    head_at = next((i for i, line in enumerate(lines) if _is_rule(line)), len(lines))
+    head_at = next((i for i, line in enumerate(lines) if logfmt.is_rule(line)), len(lines))
     events: list[dict] = []
 
     def push(**fields) -> None:
@@ -470,23 +455,23 @@ def parse_log(text: str, limit: int = _MAX_EVENTS) -> list[dict]:
 
     for raw in lines[head_at:]:
         line = raw.strip()
-        if not line or _is_rule(line):
+        if not line or logfmt.is_rule(line):
             flush()
             continue
-        section = _LOG_SECTION.match(line)
-        if section:
+        section = logfmt.SECTION_RE.match(line)
+        if section and section.group(1) in logfmt.KNOWN_TAGS:
             flush()
             tag, rest = section.group(1), section.group(2)
-            kind, role = _kind_of(tag, kind), "log"
+            kind, role = logfmt.kind_of(tag, kind), "log"
             push(kind=kind, role="log", hr=True, text=rest or tag)
             continue
-        if line == _LOG_RAW_MARK:
+        if line == logfmt.RAW_MARK:
             flush()
             role = "output"
             push(kind=kind, role="log", text="模型原始输出")
             continue
-        next_role = next((r for p, r in _LOG_ROLE_START if line.startswith(p)), None)
-        if next_role is None and _LOG_NUMBERED.match(line):
+        next_role = next((r for p, r in logfmt.ROLE_START if line.startswith(p)), None)
+        if next_role is None and logfmt.NUMBERED_RE.match(line):
             next_role = "task"
         if next_role and next_role != role:
             flush()

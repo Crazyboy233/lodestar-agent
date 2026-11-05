@@ -16,14 +16,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from lodestar_agent.config import load_config  # noqa: E402
 from lodestar_agent.control import Control  # noqa: E402
-from lodestar_agent.graph import (  # noqa: E402
-    AgentFailure,
-    ModelAborted,
-    _invoke_interruptible,
-    _parse_plan,
-    build_graph,
+from lodestar_agent.errors import AgentFailure, ModelAborted  # noqa: E402
+from lodestar_agent.graph import build_graph  # noqa: E402
+from lodestar_agent.llm import invoke_interruptible  # noqa: E402
+from lodestar_agent.parsing import extract_array, normalize_items  # noqa: E402
+from lodestar_agent.records import tasks_from_state  # noqa: E402
+from lodestar_agent.session import Runner, StartRequest  # noqa: E402
+from lodestar_agent.worker import (  # noqa: E402
+    CliOptions,
+    CliResult,
+    Verdict,
+    _diagnose,
+    _parse_json,
+    run_worker,
 )
-from lodestar_agent.worker import CliResult, Verdict, _diagnose, _parse_json, run_worker  # noqa: E402
 
 
 class FakeLLM:
@@ -44,7 +50,7 @@ class FakeLLM:
 
 
 def _fake_worker(calls: list[str], ok: bool = True):
-    def inner(task, **kwargs):
+    def inner(task, *_a, **kwargs):
         calls.append(task)
         return CliResult(ok=ok, output=f"done: {task}", duration=0.0, error="" if ok else "boom")
 
@@ -52,11 +58,11 @@ def _fake_worker(calls: list[str], ok: bool = True):
 
 
 def test_plan_sanitizes_unverifiable_criteria() -> None:
-    plan = _parse_plan(
+    plan = normalize_items(extract_array(
         '好的：\n[{"task":"做导航栏","verify":"在浏览器打开页面控制台无报错"},'
         '{"task":"写 a.txt","verify":"ls a.txt 有输出"},'
         '"纯字符串任务"]'
-    )
+    ) or [])
     assert [p["task"] for p in plan] == ["做导航栏", "写 a.txt", "纯字符串任务"]
     assert plan[0]["verify"] == "", "不可执行的验收标准必须被丢掉"
     assert plan[1]["verify"] == "ls a.txt 有输出"
@@ -71,7 +77,7 @@ def test_verify_fail_then_pass_retries_worker() -> None:
     worker_calls: list[str] = []
     seen = {"t1": 0}
 
-    def fake_verifier(task, verify, out, **kwargs):
+    def fake_verifier(task, verify, out, *_a, **kwargs):
         if task == "t1":
             seen["t1"] += 1
             if seen["t1"] == 1:
@@ -79,8 +85,8 @@ def test_verify_fail_then_pass_retries_worker() -> None:
         return Verdict(True, "通过", "", duration=0.0)
 
     plan = [{"task": "t1", "verify": "ls a.txt"}, {"task": "t2", "verify": "ls b.txt"}]
-    with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
-        "lodestar_agent.graph.run_verifier", side_effect=fake_verifier
+    with patch("lodestar_agent.nodes.run_worker", side_effect=_fake_worker(worker_calls)), patch(
+        "lodestar_agent.nodes.run_verifier", side_effect=fake_verifier
     ):
         out = app.invoke(
             {"goal": "g", "plan": plan, "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -104,8 +110,8 @@ def test_retry_cap_stops_dead_loop() -> None:
         return Verdict(False, "永远不达标", "再改", duration=0.0)
 
     plan = [{"task": "t1", "verify": "ls a.txt"}, {"task": "t2", "verify": "ls b.txt"}]
-    with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
-        "lodestar_agent.graph.run_verifier", side_effect=always_fail
+    with patch("lodestar_agent.nodes.run_worker", side_effect=_fake_worker(worker_calls)), patch(
+        "lodestar_agent.nodes.run_verifier", side_effect=always_fail
     ):
         out = app.invoke(
             {"goal": "g", "plan": plan, "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -125,12 +131,12 @@ def test_exec_failure_terminates_after_retries() -> None:
     app = build_graph(cfg, use_llm=False)
     calls: list[str] = []
 
-    def failing_worker(task, **kwargs):
+    def failing_worker(task, *_a, **kwargs):
         calls.append(task)
         return CliResult(ok=False, output="", duration=0.0, error="429 too many requests")
 
     plan = [{"task": "t1", "verify": ""}]
-    with patch("lodestar_agent.graph.run_worker", side_effect=failing_worker):
+    with patch("lodestar_agent.nodes.run_worker", side_effect=failing_worker):
         try:
             app.invoke(
                 {"goal": "g", "plan": plan, "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -157,12 +163,12 @@ def test_plan_dynamic_replan() -> None:
 
     worker_calls: list[str] = []
 
-    def always_pass(_task, _verify, _out, **_kw):
+    def always_pass(_task, _verify, _out, *_a, **_kw):
         return Verdict(True, "通过", "", duration=0.0)
 
     plan = [{"task": "t1", "verify": "ls a.txt"}, {"task": "t2", "verify": "ls b.txt"}]
-    with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
-        "lodestar_agent.graph.run_verifier", side_effect=always_pass
+    with patch("lodestar_agent.nodes.run_worker", side_effect=_fake_worker(worker_calls)), patch(
+        "lodestar_agent.nodes.run_verifier", side_effect=always_pass
     ):
         out = app.invoke(
             {"goal": "g", "plan": plan, "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -190,11 +196,11 @@ def test_plan_parse_retry() -> None:
     app = build_graph(cfg, llm=llm)
     worker_calls: list[str] = []
 
-    def always_pass(_t, _v, _o, **_kw):
+    def always_pass(_t, _v, _o, *_a, **_kw):
         return Verdict(True, "通过", "", duration=0.0)
 
-    with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
-        "lodestar_agent.graph.run_verifier", side_effect=always_pass
+    with patch("lodestar_agent.nodes.run_worker", side_effect=_fake_worker(worker_calls)), patch(
+        "lodestar_agent.nodes.run_verifier", side_effect=always_pass
     ):
         out = app.invoke(
             {"goal": "g", "plan": [], "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -223,11 +229,11 @@ def test_plan_parse_retry_exhausted_falls_back() -> None:
     app = build_graph(cfg, llm=llm)
     worker_calls: list[str] = []
 
-    def always_pass(_t, _v, _o, **_kw):
+    def always_pass(_t, _v, _o, *_a, **_kw):
         return Verdict(True, "通过", "", duration=0.0)
 
-    with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(worker_calls)), patch(
-        "lodestar_agent.graph.run_verifier", side_effect=always_pass
+    with patch("lodestar_agent.nodes.run_worker", side_effect=_fake_worker(worker_calls)), patch(
+        "lodestar_agent.nodes.run_verifier", side_effect=always_pass
     ):
         out = app.invoke(
             {"goal": "把 a 改成 b", "plan": [], "current": None, "attempts": 0, "feedback": "", "records": []},
@@ -259,16 +265,16 @@ def test_checkpoint_persists_and_resumes() -> None:
         initial = {"goal": "g", "plan": plan, "current": None, "attempts": 0, "feedback": "", "records": []}
         calls: list[str] = []
 
-        def interrupted_worker(task, **_kw):
+        def interrupted_worker(task, *_a, **_kw):
             calls.append(task)
             raise KeyboardInterrupt("模拟 Ctrl+C")
 
-        def always_pass(_t, _v, _o, **_kw):
+        def always_pass(_t, _v, _o, *_a, **_kw):
             return Verdict(True, "通过", "", duration=0.0)
 
         app = build_graph(cfg, llm=FakeLLM("汇总"), checkpointer=saver)
-        with patch("lodestar_agent.graph.run_worker", side_effect=interrupted_worker), patch(
-            "lodestar_agent.graph.run_verifier", side_effect=always_pass
+        with patch("lodestar_agent.nodes.run_worker", side_effect=interrupted_worker), patch(
+            "lodestar_agent.nodes.run_verifier", side_effect=always_pass
         ):
             try:
                 app.invoke(initial, run_config)
@@ -283,7 +289,7 @@ def test_checkpoint_persists_and_resumes() -> None:
         # 换一个图实例（模拟另起进程），从 checkpoint 续跑
         resumed: list[str] = []
 
-        def ok_worker(task, **_kw):
+        def ok_worker(task, *_a, **_kw):
             resumed.append(task)
             return CliResult(ok=True, output=f"done: {task}", duration=0.0)
 
@@ -292,8 +298,8 @@ def test_checkpoint_persists_and_resumes() -> None:
             llm=FakeLLM(['{"remaining":[],"note":"收工"}', "最终答复"]),
             checkpointer=saver,
         )
-        with patch("lodestar_agent.graph.run_worker", side_effect=ok_worker), patch(
-            "lodestar_agent.graph.run_verifier", side_effect=always_pass
+        with patch("lodestar_agent.nodes.run_worker", side_effect=ok_worker), patch(
+            "lodestar_agent.nodes.run_verifier", side_effect=always_pass
         ):
             out = app2.invoke(None, run_config)
 
@@ -321,10 +327,10 @@ def test_resume_after_exec_failure_resets_attempts() -> None:
         run_config = {"configurable": {"thread_id": "t-fail"}, "recursion_limit": 60}
         app = build_graph(cfg, use_llm=False, checkpointer=saver)
 
-        def failing(_task, **_kw):
+        def failing(_task, *_a, **_kw):
             return CliResult(ok=False, output="", duration=0.0, error="401 unauthorized")
 
-        with patch("lodestar_agent.graph.run_worker", side_effect=failing):
+        with patch("lodestar_agent.nodes.run_worker", side_effect=failing):
             try:
                 app.invoke(
                     {"goal": "g", "plan": [{"task": "t1", "verify": ""}], "current": None,
@@ -342,7 +348,7 @@ def test_resume_after_exec_failure_resets_attempts() -> None:
         # 模拟 __main__ 的 --resume：重置计数后应能重新执行同一条任务
         app.update_state(run_config, {"attempts": 0, "last_error": ""}, as_node="verify")
         calls: list[str] = []
-        with patch("lodestar_agent.graph.run_worker", side_effect=_fake_worker(calls)):
+        with patch("lodestar_agent.nodes.run_worker", side_effect=_fake_worker(calls)):
             out = app.invoke(None, run_config)
 
         assert calls == ["t1"], calls
@@ -386,20 +392,20 @@ def test_guidance_reaches_worker_once() -> None:
 
     seen: list[str] = []
 
-    def fake_worker(task, **kwargs):
+    def fake_worker(task, *_a, **kwargs):
         seen.append(kwargs.get("guidance", ""))
         if task == "t1":
             # 第一条正在跑时投第二条：不打断它，等下一次调用再注入
             control.push_note("worker", "第二条：记得写中文注释")
         return CliResult(ok=True, output=f"done: {task}", duration=0.0)
 
-    def always_pass(_t, _v, _o, **_kw):
+    def always_pass(_t, _v, _o, *_a, **_kw):
         return Verdict(True, "通过", "", duration=0.0)
 
     control.push_note("worker", "第一条：别动 index.html")
     plan = [{"task": "t1", "verify": "ls a"}, {"task": "t2", "verify": "ls b"}]
-    with patch("lodestar_agent.graph.run_worker", side_effect=fake_worker), patch(
-        "lodestar_agent.graph.run_verifier", side_effect=always_pass
+    with patch("lodestar_agent.nodes.run_worker", side_effect=fake_worker), patch(
+        "lodestar_agent.nodes.run_verifier", side_effect=always_pass
     ):
         app.invoke(
             {"goal": "g", "plan": plan, "current": None, "attempts": 0,
@@ -423,7 +429,7 @@ def test_boundary_stop_waits_for_current_node() -> None:
     calls: list[str] = []
     verdicts: list[str] = []
 
-    def finishing_worker(task, **_kwargs):
+    def finishing_worker(task, *_a, **_kwargs):
         calls.append(task)
         # 跑到一半时用户点退出 —— 关键：这次调用仍然正常返回，不被打断
         control.request_stop("测试退出")
@@ -434,8 +440,8 @@ def test_boundary_stop_waits_for_current_node() -> None:
         return Verdict(True, "通过", "", duration=0.0)
 
     plan = [{"task": "t1", "verify": "ls a"}, {"task": "t2", "verify": "ls b"}]
-    with patch("lodestar_agent.graph.run_worker", side_effect=finishing_worker), patch(
-        "lodestar_agent.graph.run_verifier", side_effect=fake_verifier
+    with patch("lodestar_agent.nodes.run_worker", side_effect=finishing_worker), patch(
+        "lodestar_agent.nodes.run_verifier", side_effect=fake_verifier
     ):
         out = app.invoke(
             {"goal": "g", "plan": plan, "current": None, "attempts": 0,
@@ -462,14 +468,14 @@ def test_forced_kill_marks_task_for_retry() -> None:
     control = Control(drain_timeout=0.01)
     app = build_graph(cfg, llm=FakeLLM("不该被调用"), control=control)
 
-    def forcing_worker(task, **_kwargs):
+    def forcing_worker(task, *_a, **_kwargs):
         control.request_stop("测试超时")
         return CliResult(ok=False, output="", duration=60.0,
                          error="超过等待上限仍未结束，已强制终止", aborted=True)
 
     plan = [{"task": "t1", "verify": "ls a"}, {"task": "t2", "verify": "ls b"}]
-    with patch("lodestar_agent.graph.run_worker", side_effect=forcing_worker), patch(
-        "lodestar_agent.graph.run_verifier", side_effect=lambda *_a, **_k: Verdict(True, "通过", "")
+    with patch("lodestar_agent.nodes.run_worker", side_effect=forcing_worker), patch(
+        "lodestar_agent.nodes.run_verifier", side_effect=lambda *_a, **_k: Verdict(True, "通过", "")
     ):
         out = app.invoke(
             {"goal": "g", "plan": plan, "current": None, "attempts": 0,
@@ -506,8 +512,8 @@ def test_cancel_event_does_not_kill_running_cli() -> None:
 
         started = time.time()
         ok_result = run_worker(
-            "do", cwd=Path(tmp) / "wd", cli=str(fake), timeout=30,
-            cancel=cancel, drain_deadline=time.time() + 30,
+            "do", CliOptions(cwd=Path(tmp) / "wd", cli=str(fake), timeout=30,
+                             cancel=cancel, drain_deadline=time.time() + 30),
         )
         elapsed = time.time() - started
         assert ok_result.ok, ok_result.error
@@ -516,8 +522,8 @@ def test_cancel_event_does_not_kill_running_cli() -> None:
 
         # 等待上限已经过了 → 才强杀
         killed = run_worker(
-            "do", cwd=Path(tmp) / "wd2", cli=str(fake), timeout=30,
-            cancel=cancel, drain_deadline=time.time() + 0.05,
+            "do", CliOptions(cwd=Path(tmp) / "wd2", cli=str(fake), timeout=30,
+                             cancel=cancel, drain_deadline=time.time() + 0.05),
         )
         assert killed.aborted is True, killed
         assert not killed.ok
@@ -548,7 +554,7 @@ def test_model_call_is_really_cut_off() -> None:
     llm = SlowLLM()
     started = _t.time()
     try:
-        _invoke_interruptible(llm, "p", lambda: True)
+        invoke_interruptible(llm, "p", lambda: True)
         raise AssertionError("应该在第一个 chunk 之后断开")
     except ModelAborted:
         pass
@@ -559,7 +565,7 @@ def test_model_call_is_really_cut_off() -> None:
     # 不到点就不该断：完整收完
     llm2 = SlowLLM()
     llm2.stream = lambda _p: iter([SimpleNamespace(content="完整答案")])
-    msg = _invoke_interruptible(llm2, "p", lambda: False)
+    msg = invoke_interruptible(llm2, "p", lambda: False)
     assert msg.content == "完整答案"
     print("ok  model_call_is_really_cut_off")
 
@@ -589,8 +595,8 @@ def test_drain_deadline_is_read_lazily() -> None:
         try:
             started = time.time()
             result = run_worker(
-                "do", cwd=Path(tmp) / "wd", cli=str(fake), timeout=30,
-                cancel=cancel, drain_deadline=lambda: box["deadline"],
+                "do", CliOptions(cwd=Path(tmp) / "wd", cli=str(fake), timeout=30,
+                                 cancel=cancel, drain_deadline=lambda: box["deadline"]),
             )
             elapsed = time.time() - started
         finally:
@@ -604,8 +610,6 @@ def test_drain_deadline_is_read_lazily() -> None:
 def test_runner_lifecycle() -> None:
     """页面驱动：start 占位 → 并发被拒 → 结束后状态回落 → reset 清掉上一轮的停止标志。"""
     import threading
-
-    from lodestar_agent.session import Runner
 
     cfg = load_config("config.yaml")
     control = Control()
@@ -621,14 +625,14 @@ def test_runner_lifecycle() -> None:
         return 0
 
     with patch("lodestar_agent.session.run_session", side_effect=fake_session):
-        info = runner.start("第一个目标")
+        info = runner.start(StartRequest(goal="第一个目标"))
         assert info["state"] == "running", info
         assert not control.stop_requested, "start 应该把上一轮的停止标志清掉"
         assert control.pending_notes("worker") == []
         assert runner.busy
 
         try:
-            runner.start("并发目标")
+            runner.start(StartRequest(goal="并发目标"))
             raise AssertionError("运行中应拒绝并发提交")
         except RuntimeError:
             pass
@@ -645,8 +649,6 @@ def test_runner_lifecycle() -> None:
 
 def test_runner_model_override() -> None:
     """页面选模型：传值就覆盖配置，传空串 = 显式用 CLI 默认，传 None = 沿用配置。"""
-    from lodestar_agent.session import Runner
-
     cfg = load_config("config.yaml")
     cfg.worker.model = "glm-5.3"
     cfg.verifier.model = "kimi-k3.1-pro"
@@ -660,16 +662,16 @@ def test_runner_model_override() -> None:
         return 0
 
     with patch("lodestar_agent.session.run_session", side_effect=fake_session):
-        runner.start("t1", worker_model="deepseek-v4.1-flash", verifier_model="")
+        runner.start(StartRequest(goal="t1", worker_model="deepseek-v4.1-flash", verifier_model=""))
         runner.join(5)
         assert seen == {"worker": "deepseek-v4.1-flash", "verifier": ""}, seen
 
-        runner.start("t2", worker_model=None, verifier_model=None)
+        runner.start(StartRequest(goal="t2", worker_model=None, verifier_model=None))
         runner.join(5)
         # None = 不覆盖，沿用上次设置后的值
         assert seen == {"worker": "deepseek-v4.1-flash", "verifier": ""}, seen
 
-        runner.start("t3", worker_model="deepseek-v4-pro", verifier_model="glm-5.2")
+        runner.start(StartRequest(goal="t3", worker_model="deepseek-v4-pro", verifier_model="glm-5.2"))
         runner.join(5)
         assert seen == {"worker": "deepseek-v4-pro", "verifier": "glm-5.2"}, seen
     print("ok  runner_model_override")
@@ -677,8 +679,6 @@ def test_runner_model_override() -> None:
 
 def test_build_tasks_states() -> None:
     """任务清单：三态映射对、同一条重跑只留最后一次、当前和剩余都在。"""
-    from lodestar_agent.session import build_tasks
-
     state = {
         "records": [
             {"task": "A", "verify": "v", "passed": True, "verified": True,
@@ -694,13 +694,47 @@ def test_build_tasks_states() -> None:
         "last_duration": 1.5,
         "plan": [{"task": "D", "verify": "v"}],
     }
-    tasks = build_tasks(state)
+    tasks = tasks_from_state(state)
 
     assert [t["task"] for t in tasks] == ["A", "B", "C", "D"], tasks
     assert [t["status"] for t in tasks] == ["fail", "skip", "running", "pending"], tasks
     assert tasks[0]["attempts"] == 2, "同一条应保留最后一次"
     assert tasks[2]["attempts"] == 2 and tasks[2]["duration"] == 1.5
     print("ok  build_tasks_states")
+
+
+def test_log_roundtrip_keeps_roles() -> None:
+    """写入端（Renderer → LogSink）与解析端（parse_log）必须对得上。
+
+    这层以前是字符串字面量的隐式协议：改一侧不报错，只会让「回看历史」的分类错位。
+    """
+    from lodestar_agent.history import parse_log
+    from lodestar_agent.view import LogSink, Renderer
+
+    lines: list[str] = []
+    sink = LogSink(lines.append)
+    renderer = Renderer()
+    for node, update in (
+        ("plan", {"stage": "init", "current": {"task": "t1", "verify": "ls a"},
+                  "plan": [], "plan_raw": "[...]"}),
+        ("worker", {"attempts": 1, "last_output": "done", "last_duration": 2.0}),
+        ("verify", {"verdict_passed": True, "verdict_reason": "通过", "verdict_ready": True}),
+        ("plan", {"action": "done", "records": [{"task": "t1", "passed": True}],
+                  "note": "收工", "decision_raw": "{}"}),
+        ("synthesize", {"answer": "[PASS] t1（1 轮）"}),
+    ):
+        for line in renderer.render(node, update):
+            sink.write(line)
+
+    events = parse_log("\n".join(lines))
+    assert [e["kind"] for e in events if e.get("hr")] == [
+        "plan", "worker", "verifier", "plan", "synth",
+    ], events
+    roles = {e.get("role") for e in events}
+    assert {"task", "output"} <= roles, roles
+    # 正文里以 [PASS] 开头的行不能被当成段落标题（dry-run 的最终答复正是这个形状）
+    assert events[-1]["kind"] == "synth" and "[PASS]" in events[-1]["text"], events[-1]
+    print("ok  log_roundtrip_keeps_roles")
 
 
 def test_config_overrides() -> None:
@@ -1113,7 +1147,7 @@ def test_worker_against_fake_cli() -> None:
             encoding="utf-8",
         )
         fake.chmod(0o755)
-        result = run_worker("do something", cwd=Path(tmp) / "wd", cli=str(fake), timeout=30)
+        result = run_worker("do something", CliOptions(cwd=Path(tmp) / "wd", cli=str(fake), timeout=30))
 
     assert result.ok, result.error
     assert result.output == "fake worker ok", result.output
@@ -1142,6 +1176,7 @@ if __name__ == "__main__":
     test_runner_lifecycle()
     test_runner_model_override()
     test_build_tasks_states()
+    test_log_roundtrip_keeps_roles()
     test_config_overrides()
     test_windows_tree_kill()
     test_folder_picker()

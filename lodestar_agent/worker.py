@@ -17,64 +17,23 @@ from __future__ import annotations
 import json
 import atexit
 import os
-import re
 import shutil
 import signal
 import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-WORKER_PROMPT = """你是 worker agent，负责独立完成下面这一个子任务。
-
-工作目录：{cwd}
-子任务：{task}
-{feedback}{guidance}
-要求：
-1. 直接在磁盘上动手（写文件 / 改文件 / 跑命令），不要只描述做法。
-2. 只做这一个子任务，不要顺手重构或扩展别的文件。
-3. 动作要收敛：先读相关文件，再改，再跑一次针对性验证；不要做无目的的全仓搜索，
-   也不要把长日志原样打出来（用 -q / --quiet / | tail -20 之类收窄）。
-4. 完成后用中文汇报 1~3 行：动了哪些文件、怎么验证的、结果如何。
-"""
-
-RESUME_HINT = """
-注意：这是接着上一次被中断的执行继续（同一个会话），不是从零开始。
-先看磁盘上已有的产出（改了一半的文件、刚写的测试），确认进度后只补没做完的部分，
-不要重做已经完成的工作。
-"""
-
-# 用户在 worker 跑动过程中投递的引导：不打断当前这一轮，等下一次调用才拼进来。
-GUIDANCE_BLOCK = """
-用户在你执行过程中插入的引导（优先级高于上面的一般要求，但仍不要越出本子任务范围）：
-{notes}
-"""
-
-VERIFIER_PROMPT = """你是独立的验收 agent，负责自己写测试脚本并执行，判定子任务是否达标。
-
-被测产出目录（其中的文件只读，不要改动、删除或覆盖）：
-{workdir}
-
-你的测试脚本目录（需要写测试脚本时就写到这里）：
-{scratch}
-
-被验收的子任务：{task}
-验收标准：{verify}
-
-worker 的自述（不可全信，只当线索）：
-{worker_output}
-
-要求：
-1. 简单的检查直接执行命令即可；需要多步或断言时，把测试写成脚本（放在 {scratch} 下），再运行它。
-2. 逐条执行验收标准里的检查，以真实命令输出为准；能跑就一定要跑。
-3. {workdir} 里的文件只读，不要修改、删除、覆盖。
-4. 任何一条不满足即判不通过，不准凭猜测放行。
-5. 最后只输出一个 JSON 对象，不要 Markdown 代码块，不要多余解释：
-{{"pass": true 或 false, "reason": "一句话结论", "fix": "给 worker 的具体修改指令；pass 时填空字符串"}}
-"""
+from .parsing import clip as _clip_text, extract_object
+from .prompts import (
+    GUIDANCE_BLOCK,
+    RESUME_HINT,
+    VERIFIER_PROMPT,
+    WORKER_PROMPT,
+)
 
 # 子进程只继承下面这些变量。
 # 宿主进程（WorkBuddy / IDE / 其他 agent）会往环境里塞几十个 CODEBUDDY_*、SERVER__PORT、
@@ -170,6 +129,27 @@ class Verdict:
     duration: float = 0.0
     error: str | None = None  # 非空表示验收 agent 自身的请求失败（不是"验收不通过"）
     aborted: bool = False  # True 表示验收过程被用户请求退出打断
+
+
+@dataclass
+class CliOptions:
+    """一次 CLI 调用的全部参数。
+
+    以前这些是 13 个关键字参数，`run_cli` 和 `_run_cli_once` 各写一遍签名，
+    中间靠 `common = dict(...)` 手工同步 —— 加一个参数要改三处，漏一处就静默失效。
+    """
+
+    cwd: Path
+    cli: str = "codebuddy"
+    model: str = ""
+    allowed_tools: str = "Read,Write,Edit,Bash"
+    add_dirs: list[Path] = field(default_factory=list)
+    timeout: float = 600.0
+    max_turns: int = 0
+    extra_env: dict[str, str] = field(default_factory=dict)
+    cancel: threading.Event | None = None
+    # 常量或回调都行：退出请求往往发生在 CLI 已经跑起来之后，进入调用时还求不出来
+    drain_deadline: float | Callable[[], float | None] | None = None
 
 
 def check_cli(cli: str) -> str:
@@ -279,55 +259,18 @@ def _read_text(path: Path) -> str:
         return ""
 
 
-def _extract_json(text: str) -> dict | None:
-    """从模型自由文本里抠出最后一个 JSON 对象（验收结论）。"""
-    text = (text or "").strip()
-    if not text:
-        return None
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            return data
-    except json.JSONDecodeError:
-        pass
-    for block in re.findall(r"```(?:json)?\s*([\s\S]*?)```", text):
-        try:
-            data = json.loads(block.strip())
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            return data
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        try:
-            data = json.loads(match.group(0))
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            pass
-    for line in reversed(text.splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(data, dict):
-                return data
-    return None
-
-
 AUTH_HINT = (
     "worker 用到的 codebuddy CLI 还没有登录态：先在本机终端执行 `codebuddy`（或 `cbc`），"
     "输入 /login 完成登录；或在 config.yaml 的 env 里配置 CODEBUDDY_AUTH_TOKEN。"
 )
 
+# 错误信息的上限：终端里只留一句人话，绝不倒 transcript
 _ERROR_LIMIT = 400
 
 
 def _clip(text: str, limit: int = _ERROR_LIMIT) -> str:
-    text = (text or "").strip()
-    return text if len(text) <= limit else text[:limit] + f"…(已截断，共 {len(text)} 字)"
+    """错误信息专用裁剪（默认 400 字）；实现与展示层共用 parsing.clip。"""
+    return _clip_text(text, limit)
 
 
 def _diagnose(raw: str) -> str:
@@ -481,21 +424,7 @@ def _cli_argv(cli_path: str, args: list[str]) -> list[str]:
     return [cli_path, *args]
 
 
-def run_cli(
-    prompt: str,
-    *,
-    cwd: Path,
-    cli: str = "codebuddy",
-    model: str = "",
-    allowed_tools: str = "Read,Write,Edit,Bash",
-    add_dirs: list[Path] | None = None,
-    timeout: float = 600.0,
-    max_turns: int = 0,
-    extra_env: dict[str, str] | None = None,
-    cancel: threading.Event | None = None,
-    drain_deadline: float | "Callable[[], float | None]" | None = None,
-    resume_session: str | None = None,
-) -> CliResult:
+def run_cli(prompt: str, opts: CliOptions, *, resume_session: str | None = None) -> CliResult:
     """跑一次 CLI。
 
     cancel / drain_deadline 是「边界退出」的接线：cancel 被置位**不会**打断已经发出去的
@@ -509,17 +438,12 @@ def run_cli(
     resume_session 非空时走 `--resume`，在同一个 CLI 会话里接着上次跑。超时重试用它：
     否则每轮都从零开始，同一份活重做三遍，永远做不完。
     """
-    common = dict(
-        cwd=cwd, cli=cli, model=model, allowed_tools=allowed_tools,
-        add_dirs=add_dirs, timeout=timeout, max_turns=max_turns,
-        extra_env=extra_env, cancel=cancel, drain_deadline=drain_deadline,
-    )
-    result = _run_cli_once(prompt, resume_session=resume_session, **common)
+    result = _run_cli_once(prompt, opts, resume_session)
     # 会话可能已经被清理（比如换了机器/清了缓存）：别让整条流程卡死在这里，
     # 退回新会话重跑一次。只兜底一次，避免无限递归。
     if resume_session and not result.ok and not result.timed_out and not result.aborted:
         if _looks_like_missing_session(result.error or ""):
-            result = _run_cli_once(prompt, resume_session=None, **common)
+            result = _run_cli_once(prompt, opts, None)
     return result
 
 
@@ -530,39 +454,25 @@ def _looks_like_missing_session(text: str) -> bool:
     return any(word in low for word in ("not found", "no such", "cannot find", "does not exist", "invalid"))
 
 
-def _run_cli_once(
-    prompt: str,
-    *,
-    cwd: Path,
-    cli: str,
-    model: str,
-    allowed_tools: str,
-    add_dirs: list[Path] | None,
-    timeout: float,
-    max_turns: int,
-    extra_env: dict[str, str] | None,
-    cancel: threading.Event | None,
-    drain_deadline: float | "Callable[[], float | None]" | None,
-    resume_session: str | None = None,
-) -> CliResult:
-    cwd = Path(cwd).expanduser().resolve()
+def _run_cli_once(prompt: str, opts: CliOptions, resume_session: str | None) -> CliResult:
+    cwd = Path(opts.cwd).expanduser().resolve()
     cwd.mkdir(parents=True, exist_ok=True)
 
-    cli_path = check_cli(cli)
+    cli_path = check_cli(opts.cli)
     cli_args = ["-p", prompt, "--output-format", "stream-json", "-y"]
     if resume_session:
         cli_args += ["--resume", resume_session]
-    if allowed_tools:
-        cli_args += ["--allowedTools", allowed_tools]
-    if model:
-        cli_args += ["--model", model]
-    if max_turns and max_turns > 0:
-        cli_args += ["--max-turns", str(max_turns)]
-    for d in add_dirs or []:
+    if opts.allowed_tools:
+        cli_args += ["--allowedTools", opts.allowed_tools]
+    if opts.model:
+        cli_args += ["--model", opts.model]
+    if opts.max_turns and opts.max_turns > 0:
+        cli_args += ["--max-turns", str(opts.max_turns)]
+    for d in opts.add_dirs or []:
         cli_args += ["--add-dir", str(d)]
     cmd = _cli_argv(cli_path, cli_args)
 
-    env = _child_env(extra_env)
+    env = _child_env(opts.extra_env)
 
     # 输出落文件，不走管道：CLI 是 Node 程序，stdout 接管道时是异步写，
     # process.exit(0) 会把没 flush 完的部分丢掉（退出码还是 0，最难查）。
@@ -588,18 +498,20 @@ def _run_cli_once(
 
     def _deadline() -> float | None:
         # 每次轮询都重新求值：退出请求可能在这次调用开始之后才发生
-        return drain_deadline() if callable(drain_deadline) else drain_deadline
+        deadline = opts.drain_deadline
+        return deadline() if callable(deadline) else deadline
 
     try:
         # 输出不再走管道，所以只用 poll 轮询即可，不存在读空管道的死锁。
         while proc.poll() is None:
             now = time.time()
             limit = _deadline()
+            cancel = opts.cancel
             if cancel is not None and cancel.is_set() and limit is not None and now >= limit:
                 forced = True
                 _terminate_tree(proc, grace=3.0)
                 break
-            if now - started > timeout:
+            if now - started > opts.timeout:
                 timed_out = True
                 _terminate_tree(proc)
                 break
@@ -656,7 +568,7 @@ def _run_cli_once(
             output=_clip(events.progress() or output, 2000),
             duration=duration,
             session_id=session_id,
-            error=f"超时：超过 {timeout:.0f}s（已终止整个子进程组；中断前的产出已保留）",
+            error=f"超时：超过 {opts.timeout:.0f}s（已终止整个子进程组；中断前的产出已保留）",
             timed_out=True,
         )
 
@@ -665,7 +577,7 @@ def _run_cli_once(
     failed = proc.returncode != 0 or events.is_error or bool((data or {}).get("is_error"))
     turns_text = " ".join([raw.lower()] + [t.lower() for t in events.assistant_texts[-2:]])
     if failed and "max turns" in turns_text:
-        limit_desc = f"--max-turns {max_turns}" if max_turns and max_turns > 0 else "CLI 默认上限"
+        limit_desc = f"--max-turns {opts.max_turns}" if opts.max_turns and opts.max_turns > 0 else "CLI 默认上限"
         return CliResult(
             ok=False,
             output=_clip(output, 800),
@@ -703,13 +615,12 @@ def _run_cli_once(
 
 def run_worker(
     task: str,
+    opts: CliOptions,
     *,
-    cwd: Path,
     feedback: str = "",
     guidance: str = "",
     resume_session: str = "",
     on_prompt: Callable[[str], None] | None = None,
-    **kwargs,
 ) -> CliResult:
     """worker agent：干活。
 
@@ -731,33 +642,32 @@ def run_worker(
     if guidance.strip():
         guide = GUIDANCE_BLOCK.format(notes=guidance.strip())
     prompt = WORKER_PROMPT.format(
-        cwd=Path(cwd).expanduser().resolve(), task=task, feedback=extra, guidance=guide
+        cwd=Path(opts.cwd).expanduser().resolve(), task=task, feedback=extra, guidance=guide
     )
     if on_prompt is not None:
         on_prompt(prompt)   # 页面要把「这次调用真正收到的 prompt」原样打出来
-    return run_cli(prompt, cwd=cwd, resume_session=resume_session or None, **kwargs)
+    return run_cli(prompt, opts, resume_session=resume_session or None)
 
 
 def run_verifier(
     task: str,
     verify: str,
     worker_output: str,
+    opts: CliOptions,
     *,
-    cwd: Path,
     scratch: Path | None = None,
     max_retries: int = 0,
     on_prompt: Callable[[str], None] | None = None,
-    **kwargs,
 ) -> Verdict:
     """验收 agent：自己写 test 脚本自己跑，判定是否达标。
 
-    被测目录 = cwd（只读，通过 add_dirs 暴露）；测试脚本写到独立的 scratch 目录，
+    被测目录 = opts.cwd（只读，通过 add_dirs 暴露）；测试脚本写到独立的 scratch 目录，
     这样即使验收 agent 用 Write/Bash 写脚本，也不会污染 worker 的产出。
 
     验收 agent 自身的请求失败（超时/429/CLI 报错）会重试 max_retries 次，
     仍失败则返回 error 非空的 Verdict（由调用方决定是否终止流程）。
     """
-    workdir = Path(cwd).expanduser().resolve()
+    workdir = Path(opts.cwd).expanduser().resolve()
     scratch = Path(scratch).expanduser().resolve() if scratch else workdir / ".verify"
     scratch.mkdir(parents=True, exist_ok=True)
 
@@ -771,12 +681,13 @@ def run_verifier(
     )
     if on_prompt is not None:
         on_prompt(prompt)   # 重试时 prompt 不变，只打一次
-    extra_dirs = [workdir] + list(kwargs.pop("add_dirs", []) or [])
+    # 被测目录必须显式授权（验收 agent 的 cwd 是 scratch），其余参数原样继承
+    run_opts = replace(opts, cwd=scratch, add_dirs=[workdir] + list(opts.add_dirs))
 
     result: CliResult | None = None
     last_err = "未知错误"
     for attempt in range(max(1, max_retries + 1)):
-        result = run_cli(prompt, cwd=scratch, add_dirs=extra_dirs, **kwargs)
+        result = run_cli(prompt, run_opts)
         if result.ok:
             break
         if result.aborted:
@@ -802,7 +713,7 @@ def run_verifier(
             error=f"验收 agent 请求失败（重试 {max_retries} 次后仍失败）：{last_err}",
         )
 
-    data = _extract_json(result.output)
+    data = extract_object(result.output)
     if data is None or "pass" not in data:
         # 解析不出结论就保守判失败，并把原文交给 worker 参考
         return Verdict(

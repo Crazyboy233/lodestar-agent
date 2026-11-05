@@ -23,14 +23,14 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import uvicorn
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from .config import as_editable, collect_overrides, save_overrides
 from .control import Control
 from .fspick import PickUnavailable, pick_directory
 from .history import HistoryStore, parse_log
-from .session import StartRequest
+from .session import EMPTY_SESSION, StartRequest
 
 _STATIC = (Path(__file__).resolve().parent / "static").resolve()
 
@@ -77,42 +77,47 @@ def _parse_start(payload: dict) -> StartRequest:
 
 
 def _snapshot(control: Control, meta: dict, runner) -> dict:
-    stopping = control.stop_requested
-    session = (
-        runner.session if runner is not None
-        else {"goal": "", "thread": "", "state": "idle", "code": None,
-              "started": 0.0, "ended": 0.0, "error": "",
-              "workerModel": "", "verifierModel": ""}
-    )
+    """GET /state 的快照：Control 的可观测状态 + 这一次运行的整体状态。"""
+    session = runner.session if runner is not None else dict(EMPTY_SESSION)
     return {
-        "host": "",
-        "port": 0,
         "meta": meta,
         "session": session,
         "workdir": str(runner.cfg.worker.workdir) if runner is not None
         else str(meta.get("workdir") or ""),
         "running": bool(runner.busy) if runner is not None else False,
-        "stop_requested": stopping,
+        "stop_requested": control.stop_requested,
         "stop_reason": control.stop_reason,
         # 事件总线的最新 seq：页面据此决定 SSE 从哪儿开始订阅 ——
         # 接的是已结束的那一轮就跳过它的 backlog，别让旧事件把界面重新点亮
         "seq": control.bus.seq,
-        "waited": round(time.time() - control.stop_ts, 1) if stopping else 0,
-        "busy": control.busy,
-        "busyDetail": control.busy_detail,
-        "model": control.busy_model,
-        "task": control.busy_task,
-        "attempt": control.busy_attempt,
-        "maxAttempts": control.busy_max_attempts,
-        "busySince": control.busy_since,
-        "drainTimeout": control.drain_timeout,
-        "pending": {t: len(control.pending_notes(t)) for t in Control.TARGETS},
+        **control.snapshot(),
     }
+
+
+def _require(runner):
+    """历史类接口的公共前置：没有运行器就 400，返回 (cfg, store)。"""
+    if runner is None:
+        raise HTTPException(400, "当前进程没有绑定运行器")
+    return runner.cfg, HistoryStore(runner.cfg.root)
+
+
+async def _json_error(_request: Request, exc: HTTPException) -> JSONResponse:
+    """把 HTTPException 统一成页面认的 `{ok: false, error}` 形状。
+
+    这样各接口只需要 `raise HTTPException(...)`，不用每个都手写一份
+    JSONResponse(ok=False)，也不会漏掉某处而让前端读到 `detail`。
+    """
+    return JSONResponse(
+        {"ok": False, "error": exc.detail}, status_code=exc.status_code,
+        headers=getattr(exc, "headers", None),
+    )
 
 
 def create_app(control: Control, meta: dict, runner, stopping: threading.Event) -> FastAPI:
     app = FastAPI(title="Lodestar Console", docs_url=None, redoc_url=None)
+    app.add_exception_handler(HTTPException, _json_error)
 
+    # ── 静态产物 ──────────────────────────────────────────
     @app.get("/")
     def index() -> FileResponse:
         target = _STATIC / "index.html"
@@ -127,23 +132,21 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
             raise HTTPException(404, "not found")
         return FileResponse(target, headers=_NO_STORE)
 
+    # ── 状态与配置 ────────────────────────────────────────
     @app.get("/state")
     def get_state() -> JSONResponse:
         return JSONResponse(_snapshot(control, meta, runner))
 
     @app.get("/config")
     def get_config() -> JSONResponse:
-        if runner is None:
-            return JSONResponse({"ok": False, "error": "当前进程没有绑定运行器"}, status_code=400)
-        return JSONResponse({"ok": True, "config": as_editable(runner.cfg)})
+        cfg, _store = _require(runner)
+        return JSONResponse({"ok": True, "config": as_editable(cfg)})
 
+    # ── 历史 ──────────────────────────────────────────────
     @app.get("/history")
     def get_history() -> JSONResponse:
         """左侧导航的数据源：按产出目录分组的历史会话。"""
-        if runner is None:
-            return JSONResponse({"ok": False, "error": "当前进程没有绑定运行器"}, status_code=400)
-        cfg = runner.cfg
-        store = HistoryStore(cfg.root)
+        cfg, store = _require(runner)
         current = runner.session.get("thread", "") if runner.busy else ""
         return JSONResponse(store.groups(
             cfg.root / "checkpoints.sqlite", str(cfg.worker.workdir), current=current,
@@ -151,13 +154,10 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
 
     @app.get("/history/{thread}")
     def get_history_detail(thread: str) -> JSONResponse:
-        if runner is None:
-            return JSONResponse({"ok": False, "error": "当前进程没有绑定运行器"}, status_code=400)
-        cfg = runner.cfg
-        store = HistoryStore(cfg.root)
+        cfg, store = _require(runner)
         item = store.detail(cfg.root / "checkpoints.sqlite", thread, str(cfg.worker.workdir))
         if item is None:
-            return JSONResponse({"ok": False, "error": f"没有这个会话：{thread}"}, status_code=404)
+            raise HTTPException(404, f"没有这个会话：{thread}")
         return JSONResponse({"ok": True, "item": item})
 
     @app.get("/history/{thread}/log")
@@ -166,17 +166,11 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
 
         日志路径来自 history.json（本进程自己写的），仍然只认 root 下的文件。
         """
-        if runner is None:
-            return JSONResponse({"ok": False, "error": "当前进程没有绑定运行器"}, status_code=400)
-        cfg = runner.cfg
-        store = HistoryStore(cfg.root)
+        cfg, store = _require(runner)
         path = store.log_path(thread)
         if path is None:
-            item = next((x for x in store.items() if x.get("thread") == thread), None)
-            if item is None:
-                return JSONResponse(
-                    {"ok": False, "error": f"没有这个会话：{thread}"}, status_code=404,
-                )
+            if not any(x.get("thread") == thread for x in store.items()):
+                raise HTTPException(404, f"没有这个会话：{thread}")
             return JSONResponse({"ok": True, "events": [], "note": "这次运行没有留下日志"})
         root = Path(cfg.root).expanduser().resolve()
         try:
@@ -188,26 +182,22 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
         try:
             text = target.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            return JSONResponse({"ok": False, "error": f"读取日志失败：{exc}"}, status_code=500)
+            raise HTTPException(500, f"读取日志失败：{exc}") from exc
         return JSONResponse({"ok": True, "events": parse_log(text)})
 
     @app.delete("/history/{thread}")
     def delete_history(thread: str) -> JSONResponse:
         """删掉一条会话历史（json 条目 + 它的 checkpoint），删掉后不能再续跑。"""
-        if runner is None:
-            return JSONResponse({"ok": False, "error": "当前进程没有绑定运行器"}, status_code=400)
-        cfg = runner.cfg
+        cfg, store = _require(runner)
         # 正在跑的那条不能删：图还挂在它的 thread 上，删库会让后续写入没地方落
         current = runner.session.get("thread", "") if runner.busy else ""
         if current and current == thread:
-            return JSONResponse(
-                {"ok": False, "error": "这个会话正在运行，等它结束再删"}, status_code=409,
-            )
-        store = HistoryStore(cfg.root)
+            raise HTTPException(409, "这个会话正在运行，等它结束再删")
         if not store.delete(cfg.root / "checkpoints.sqlite", thread):
-            return JSONResponse({"ok": False, "error": f"没有这个会话：{thread}"}, status_code=404)
+            raise HTTPException(404, f"没有这个会话：{thread}")
         return JSONResponse({"ok": True})
 
+    # ── SSE ───────────────────────────────────────────────
     @app.get("/events")
     async def get_events(since: int = Query(0)) -> StreamingResponse:
         q = control.bus.subscribe(since)
@@ -233,32 +223,30 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
             headers={**_NO_STORE, "X-Accel-Buffering": "no"},
         )
 
+    # ── 命令 ──────────────────────────────────────────────
     @app.post("/command")
     async def do_command(payload: Annotated[dict[str, Any], Body()]) -> JSONResponse:
         kind = str(payload.get("type") or "").strip()
 
         if kind == "run":
-            if runner is None:
-                return JSONResponse({"ok": False, "error": "当前进程没有绑定运行器"}, status_code=400)
             # 续跑前写好的引导也在里面：跟这次 run 一起投进信箱，
             # 开跑那一刻不会被 reset 冲掉
+            _require(runner)
             try:
                 info = runner.start(_parse_start(payload))
             except RuntimeError as exc:
-                return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
+                raise HTTPException(409, str(exc)) from exc
             except ValueError as exc:
-                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+                raise HTTPException(400, str(exc)) from exc
             return JSONResponse({"ok": True, "session": info})
 
         if kind == "config":
-            if runner is None:
-                return JSONResponse({"ok": False, "error": "当前进程没有绑定运行器"}, status_code=400)
+            _require(runner)
             if runner.busy:
-                return JSONResponse({"ok": False, "error": "任务正在运行，等它结束再改配置"},
-                                    status_code=409)
+                raise HTTPException(409, "任务正在运行，等它结束再改配置")
             body = payload.get("payload")
             if not isinstance(body, dict):
-                return JSONResponse({"ok": False, "error": "payload 必须是对象"}, status_code=400)
+                raise HTTPException(400, "payload 必须是对象")
             patch, errors = collect_overrides(body, runner.cfg.main_agent.api_key)
             if errors:
                 return JSONResponse({"ok": False, "errors": errors}, status_code=400)
@@ -269,7 +257,7 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
                 save_overrides(runner.cfg.root, patch)
                 new_cfg = runner.reload_config()
             except Exception as exc:  # noqa: BLE001 - 保存失败要原样告诉页面
-                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+                raise HTTPException(500, str(exc)) from exc
             control.drain_timeout = new_cfg.ui.drain_timeout_seconds
             control.emit("配置已保存到 config.local.yaml（下次开始任务生效）", kind="system")
             return JSONResponse({"ok": True, "config": as_editable(new_cfg),
@@ -281,22 +269,19 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
             try:
                 picked = await asyncio.to_thread(pick_directory)
             except PickUnavailable as exc:
-                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+                raise HTTPException(400, str(exc)) from exc
             if not picked:
                 return JSONResponse({"ok": True, "path": "", "canceled": True})
             return JSONResponse({"ok": True, "path": picked})
 
         if kind == "guide":
             target = str(payload.get("target") or "main").strip()
-            text = str(payload.get("text") or "").strip()
             if target not in Control.TARGETS:
-                return JSONResponse(
-                    {"ok": False, "error": f"target 必须是 {list(Control.TARGETS)}"},
-                    status_code=400,
-                )
-            if not text:
-                return JSONResponse({"ok": False, "error": "引导内容为空"}, status_code=400)
-            note = control.push_note(target, text)
+                raise HTTPException(400, f"target 必须是 {list(Control.TARGETS)}")
+            try:
+                note = control.push_note(target, str(payload.get("text") or "").strip())
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
             return JSONResponse({"ok": True, "note": note})
 
         if kind == "stop":
@@ -313,9 +298,8 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
                 control.emit(f"[页面异常] {message}", kind="stop")
             return JSONResponse({"ok": True})
 
-        return JSONResponse(
-            {"ok": False, "error": "type 必须是 run / config / guide / stop / pickdir / clientlog"},
-            status_code=400,
+        raise HTTPException(
+            400, "type 必须是 run / config / guide / stop / pickdir / clientlog",
         )
 
     return app

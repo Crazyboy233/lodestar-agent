@@ -114,26 +114,35 @@ class Control:
 
     def status(self, state: str, detail: str = "") -> dict:
         """state: starting / running / busy / draining / done / aborted / failed"""
-        stopping = self._stop.is_set()
         return self.bus.publish({
-            "type": "status",
-            "state": state,
-            "stage": self._stage,
-            "detail": detail,
-            "elapsed": round(time.time() - self._started, 1),
-            # 当前这一次模型调用是谁在跑、用哪个模型、跑哪条任务 —— 页面顶部的工作栏靠这个渲染
-            "busy": self._busy,
-            "busyDetail": self._busy_detail,
-            "model": self._busy_model,
-            "task": self._busy_task,
-            "attempt": self._busy_attempt,
-            "maxAttempts": self._busy_max_attempts,
-            "busySince": self._busy_since,
-            "draining": stopping,
-            "waited": round(time.time() - self._stop_ts, 1) if stopping else 0,
-            "drainTimeout": self.drain_timeout,
-            "pending": {t: len(v) for t, v in self._notes.items()},
+            "type": "status", "state": state, "detail": detail, **self.snapshot(),
         })
+
+    def snapshot(self) -> dict:
+        """当前这一刻的可观测状态。
+
+        `status` 事件（SSE）和 `server._snapshot`（GET /state）都从这里取，
+        以前两处各自手拼同一组字段，漏改一处就会出现「刷新页面和实时流对不上」。
+        """
+        with self._lock:
+            stopping = self._stop.is_set()
+            pending = {t: len(v) for t, v in self._notes.items()}
+            return {
+                "stage": self._stage,
+                "elapsed": round(time.time() - self._started, 1),
+                # 当前这一次模型调用是谁在跑、用哪个模型、跑哪条任务 —— 顶部工作栏靠这个渲染
+                "busy": self._busy,
+                "busyDetail": self._busy_detail,
+                "model": self._busy_model,
+                "task": self._busy_task,
+                "attempt": self._busy_attempt,
+                "maxAttempts": self._busy_max_attempts,
+                "busySince": self._busy_since,
+                "draining": stopping,
+                "waited": round(time.time() - self._stop_ts, 1) if stopping else 0,
+                "drainTimeout": self.drain_timeout,
+                "pending": pending,
+            }
 
     def set_stage(self, stage: str) -> None:
         with self._lock:
@@ -209,18 +218,22 @@ class Control:
             self._stop_ts = 0.0
             self._drain_deadline = None
             self._notes = {t: [] for t in self.TARGETS}
-            self._busy = None
-            self._busy_detail = ""
-            self._busy_model = ""
-            self._busy_task = ""
-            self._busy_attempt = 0
-            self._busy_max_attempts = 0
-            self._busy_since = 0.0
+            self._clear_busy()
             self._stage = "启动"
             self._started = time.time()
         self.bus.clear()
         self.bus.publish({"type": "reset"})
         self.status("starting", "新任务")
+
+    def _clear_busy(self) -> None:
+        """把「正在跑哪次调用」的七个字段一起清掉（调用方需持有 self._lock）。"""
+        self._busy = None
+        self._busy_detail = ""
+        self._busy_model = ""
+        self._busy_task = ""
+        self._busy_attempt = 0
+        self._busy_max_attempts = 0
+        self._busy_since = 0.0
 
     # ── 引导信箱 ──────────────────────────────────────────
     def push_note(self, target: str, text: str) -> dict:
