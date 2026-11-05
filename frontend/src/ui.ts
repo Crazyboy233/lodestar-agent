@@ -1,4 +1,4 @@
-import type { NodeName, RunState, SessionState, TaskStatus } from './types';
+import type { NodeName, RunMeta, RunState, SessionState, TaskStatus } from './types';
 
 export const STATE_TEXT: Record<RunState | SessionState, string> = {
   idle: '待开始',
@@ -71,4 +71,16 @@ export function fmtFullTime(tsSeconds: number): string {
   const d = new Date(tsSeconds * 1000);
   const p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 模型下拉的候选：空串 = 「CLI 决定」，永远排第一；配置里的列表 + 当前生效值都放进来 */
+export function modelOptions(meta: RunMeta): string[] {
+  const base = [''];
+  for (const m of meta.models ?? []) {
+    if (m && !base.includes(m)) base.push(m);
+  }
+  for (const v of [meta.workerModel, meta.verifierModel]) {
+    if (v && !base.includes(v)) base.push(v);
+  }
+  return base;
 }

@@ -385,10 +385,21 @@ def build_graph(cfg: Config, use_llm: bool = True, llm=None, checkpointer=None,
         deadline = control.drain_deadline
         return deadline is not None and time.time() >= deadline
 
+    def _emit_prompt(kind: str, label: str, prompt: str) -> None:
+        """把这次模型调用「真正收到的 prompt」原样推进事件流。
+
+        页面上归为「派发」，默认折叠 10 行，展开就是全文 —— 想知道节点到底被喂了什么，
+        不用再翻日志文件。kind 用节点名，颜色跟节点走。
+        """
+        if control is None:
+            return
+        control.emit(f"prompt → {label}\n{prompt}", kind=kind, role="prompt")
+
     def _ask(node: str, label: str, prompt: str):
         """主 agent 的模型调用统一走这里：前后打点 + 可中断，页面才知道谁在干活。"""
         if control is not None:
             control.set_busy(node, model=cfg.main_agent.model)
+        _emit_prompt(node, label, prompt)
         try:
             return _call_llm(
                 llm, label, prompt, cfg.main_agent.max_retries,
@@ -635,6 +646,7 @@ def build_graph(cfg: Config, use_llm: bool = True, llm=None, checkpointer=None,
                 cwd=cfg.worker.workdir,
                 feedback=state.get("feedback", ""),
                 guidance=guidance,
+                on_prompt=lambda text: _emit_prompt("worker", "worker(执行)", text),
                 cli=cfg.worker.cli,
                 model=cfg.worker.model,
                 allowed_tools=cfg.worker.allowed_tools,
@@ -702,6 +714,7 @@ def build_graph(cfg: Config, use_llm: bool = True, llm=None, checkpointer=None,
                     state.get("last_output", ""),
                     cwd=cfg.worker.workdir,
                     scratch=cfg.worker.workdir / cfg.verifier.scratch_dir,
+                    on_prompt=lambda text: _emit_prompt("verifier", "verifier(验收)", text),
                     max_retries=cfg.verifier.max_retries,
                     cli=cfg.verifier.cli,
                     model=cfg.verifier.model,

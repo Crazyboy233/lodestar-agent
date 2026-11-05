@@ -1,85 +1,45 @@
 import { useState } from 'react';
-import type { NoteItem, Status } from '../types';
-import { NODE_LABEL } from '../ui';
+import type { NoteItem } from '../types';
 
 interface Props {
   notes: NoteItem[];
-  status: Status;
-  disabled: boolean;
-  onSend: (target: 'main' | 'worker', text: string) => Promise<string | null>;
 }
 
-export function GuidePanel({ notes, status, disabled, onSend }: Props) {
-  const [target, setTarget] = useState<'main' | 'worker'>('main');
-  const [text, setText] = useState('');
-  const [hint, setHint] = useState('');
-  const [sending, setSending] = useState(false);
+/**
+ * 只负责「投递记录」：投递入口已经统一到事件流下方的对话框，
+ * 这里不再重复输入框，避免两处都能发引导、看着像两套功能。
+ */
+export function GuidePanel({ notes }: Props) {
+  const [open, setOpen] = useState<Set<string>>(() => new Set());
+  const pending = notes.filter((n) => !n.consumed).length;
 
-  const send = async () => {
-    const body = text.trim();
-    if (!body) return;
-    setSending(true);
-    setHint('');
-    const err = await onSend(target, body);
-    setSending(false);
-    if (err) setHint(err);
-    else setText('');
+  const toggle = (id: string) => {
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
   };
-
-  const busyHint = status.busy === 'worker'
-    ? 'worker 正在执行，这条引导会在它下一次被调用时生效'
-    : status.busy === 'verifier'
-      ? '验收正在进行，这条引导会在下一轮规划 / 执行时生效'
-      : '例如：改 script.js 就行，别动 index.html';
 
   return (
     <div className="card guide">
-      <h2>引导</h2>
-      <p className="hint">
-        投递后排队，不打断正在执行的那一轮，在下一个节点边界生效。
-        {status.busy && ` 当前：${NODE_LABEL[status.busy]}。`}
-      </p>
-
-      <div className="tabs">
-        {(['main', 'worker'] as const).map((t) => (
-          <button
-            key={t}
-            className={target === t ? 'on' : ''}
-            onClick={() => setTarget(t)}
-          >
-            {t === 'main' ? '主 agent' : 'worker'}
-          </button>
-        ))}
+      <div className="card-head">
+        <h2>引导投递</h2>
+        <span className="tasks-sum">
+          {notes.length ? (pending ? `${pending} 待注入 / ${notes.length}` : `${notes.length} 条`) : '—'}
+        </span>
       </div>
-
-      <textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-            e.preventDefault();
-            void send();
-          }
-        }}
-        placeholder={busyHint}
-        disabled={disabled}
-      />
-
-      <div className="send-row">
-        <span className="kb">⌘ / Ctrl + ↵</span>
-        <button className="primary" onClick={() => void send()} disabled={disabled || sending}>
-          {sending ? '发送中…' : '发送'}
-        </button>
-      </div>
-      {hint && <div className="launch-hint">{hint}</div>}
-
-      <div className="sub">投递记录</div>
       <ul id="notes">
         {notes.length === 0 && <li className="empty">还没有投递</li>}
         {notes.map((n) => (
-          <li key={n.id} className={n.consumed ? 'consumed' : ''}>
+          <li
+            key={n.id}
+            className={`${n.consumed ? 'consumed' : ''}${open.has(n.id) ? ' open' : ''}`.trim()}
+            onClick={() => toggle(n.id)}
+          >
             <span className="tgt">{n.target === 'worker' ? 'worker' : 'main'}</span>
-            <span className="txt" title={n.text}>{n.text}</span>
+            <span className="txt">{n.text}</span>
             <span className="st">{n.consumed ? '已注入' : '待注入'}</span>
           </li>
         ))}

@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { RunMeta } from '../types';
 import { pickDirectory } from '../api';
+import { modelOptions } from '../ui';
 
 export interface StartPayload {
   goal: string;
-  thread: string;
-  resume: boolean;
   workerModel: string;
   verifierModel: string;
   workdir: string;
@@ -19,10 +18,12 @@ interface Props {
   /** 从历史「在此目录新建任务」带过来的预填值 */
   preset?: { goal: string; workdir: string; n: number } | null;
   onStart: (payload: StartPayload) => Promise<string | null>;
-  /** 运行中把底部输入当引导用：发给主 agent，下一个节点边界生效 */
-  onGuide: (text: string) => Promise<string | null>;
+  /** 运行中把底部输入当引导用：按收件人投递，下一个节点边界生效 */
+  onGuide: (target: 'main' | 'worker', text: string) => Promise<string | null>;
   /** 已经点了边界退出 / 正在收尾：不再接受新的引导 */
   guideLocked?: boolean;
+  /** 各收件人还排着几条没注入 */
+  pending?: Record<string, number>;
 }
 
 function FolderIcon() {
@@ -37,18 +38,17 @@ function FolderIcon() {
 }
 
 export function LaunchPanel({
-  meta, running, defaultWorkdir, preset, onStart, onGuide, guideLocked = false,
+  meta, running, defaultWorkdir, preset, onStart, onGuide, guideLocked = false, pending,
 }: Props) {
   const [goal, setGoal] = useState('');
-  const [thread, setThread] = useState('');
-  const [resume, setResume] = useState(false);
   const [workerModel, setWorkerModel] = useState('');
   const [verifierModel, setVerifierModel] = useState('');
   const [workdir, setWorkdir] = useState('');
   const [hint, setHint] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [picking, setPicking] = useState(false);
-  // 运行中：底部输入切成「给主 agent 的引导」
+  // 运行中：底部输入切成「引导」，投给哪个节点在按钮上选
+  const [target, setTarget] = useState<'main' | 'worker'>('main');
   const [note, setNote] = useState('');
   const [sending, setSending] = useState(false);
   const [sent, setSent] = useState('');
@@ -69,19 +69,8 @@ export function LaunchPanel({
     }
   }, [preset]);
 
-  const models = useMemo(() => {
-    // 空串 = 「默认（由 CLI 决定）」，永远放在第一个：
-    // 配置里的候选列表不一定包含它，但页面上必须能选回默认。
-    const base = [''];
-    for (const m of meta.models ?? []) {
-      if (m && !base.includes(m)) base.push(m);
-    }
-    // 配置里写了列表外的自定义模型也要能显示，别被静默改成「默认」
-    for (const v of [meta.workerModel, meta.verifierModel]) {
-      if (v && !base.includes(v)) base.push(v);
-    }
-    return base;
-  }, [meta.models, meta.workerModel, meta.verifierModel]);
+  // 空串 = 「默认（由 CLI 决定）」，永远放第一个，见 ui.modelOptions
+  const models = useMemo(() => modelOptions(meta), [meta]);
 
   // 运行状态切换时清空引导草稿和上次的提示，避免把上一轮的残留带到下一轮
   useEffect(() => {
@@ -89,6 +78,7 @@ export function LaunchPanel({
     setSent('');
     setHint('');
     setSending(false);
+    setTarget('main');
   }, [running]);
 
   useEffect(() => {
@@ -122,8 +112,8 @@ export function LaunchPanel({
 
   const submit = async () => {
     if (picking) return;
-    if (!goal.trim() && !resume) {
-      setHint('先写个目标，或填 thread 并勾选续跑');
+    if (!goal.trim()) {
+      setHint('先写个目标');
       return;
     }
     setSubmitting(true);
@@ -131,8 +121,6 @@ export function LaunchPanel({
     if (workdir.trim()) localStorage.setItem('lodestar.workdir', workdir.trim());
     const err = await onStart({
       goal: goal.trim(),
-      thread: thread.trim(),
-      resume,
       workerModel,
       verifierModel,
       workdir: workdir.trim(),
@@ -142,11 +130,9 @@ export function LaunchPanel({
       setHint(err);
       return;
     }
-    // 启动成功后清掉这一轮输入：任务结束后底部恢复成空的新任务框，
-    // 不会把上一次的目标/thread 再提交一遍
+    // 启动成功后清掉目标：任务结束后底部恢复成空的新任务框，
+    // 不会把上一次的目标再提交一遍
     setGoal('');
-    setThread('');
-    setResume(false);
   };
 
   const sendGuide = async () => {
@@ -154,15 +140,22 @@ export function LaunchPanel({
     setSending(true);
     setHint('');
     setSent('');
-    const err = await onGuide(note.trim());
+    const err = await onGuide(target, note.trim());
     setSending(false);
     if (err) {
       setHint(err);
       return;
     }
     setNote('');
-    setSent('已投递，会在下一个节点边界生效');
+    setSent(`已投递给${target === 'main' ? '主 agent' : 'worker'}，会在下一个节点边界生效`);
   };
+
+  const queued = pending
+    ? [
+      pending.main ? `主 agent ${pending.main}` : '',
+      pending.worker ? `worker ${pending.worker}` : '',
+    ].filter(Boolean).join(' · ')
+    : '';
 
   // 运行中：同一块圆角输入区，但只发引导，不显示目录 / 模型这些启动参数
   if (running) {
@@ -183,20 +176,36 @@ export function LaunchPanel({
           disabled={guideLocked}
           placeholder={guideLocked
             ? '正在收尾，已停止接受新的引导'
-            : '给主 agent 投递引导：下一个节点生效，不打断当前这一轮'}
+            : target === 'main'
+              ? '给主 agent 的引导：下一个节点边界生效，不打断当前这一轮'
+              : '给 worker 的引导：它下一次被调用时生效，不打断当前这一轮'}
         />
         <div className="launch-opts">
+          <div className="guide-targets" role="group" aria-label="引导投给哪个节点">
+            {(['main', 'worker'] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                className={target === t ? 'on' : ''}
+                disabled={guideLocked}
+                onClick={() => setTarget(t)}
+              >
+                {t === 'main' ? '主 agent' : 'worker'}
+                {pending?.[t] ? <span className="n">{pending[t]}</span> : null}
+              </button>
+            ))}
+          </div>
           <span className="composer-hint">
             {guideLocked
               ? '正在等待当前这一轮结束，然后退出'
-              : 'worker 的引导和待投递记录在右侧「引导」面板'}
+              : (queued ? `已排队 ${queued}` : '⌘ / Ctrl + ↵ 发送')}
           </span>
           <button
             className="primary"
             disabled={guideLocked || !note.trim() || sending}
             onClick={() => void sendGuide()}
           >
-            {sending ? '发送中…' : '发送引导'}
+            {sending ? '发送中…' : '投递引导'}
           </button>
         </div>
         {hint && <div className="launch-hint">{hint}</div>}
@@ -245,19 +254,6 @@ export function LaunchPanel({
         >
           默认
         </button>
-      </div>
-
-      <div className="launch-opts">
-        <input
-          type="text"
-          value={thread}
-          onChange={(e) => setThread(e.target.value)}
-          placeholder="thread（留空自动生成）"
-        />
-        <label className="chk">
-          <input type="checkbox" checked={resume} onChange={(e) => setResume(e.target.checked)} />
-          续跑
-        </label>
       </div>
 
       <div className="launch-opts">

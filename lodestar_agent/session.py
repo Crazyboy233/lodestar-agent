@@ -34,6 +34,9 @@ class Console:
     """终端 + 页面双写。
 
     kind 决定页面上的标签与左边色条：plan / worker / verifier / synth / stop / system。
+    role 决定这一条属于哪一类内容，页面据此区分「节点收到的 prompt / 节点的输出 / 旁白日志」：
+    head（段落标题）/ prompt（派给节点的任务与验收）/ output（节点产出）/ log（流程说明）。
+
     终端行为与改造前保持一致（分隔线、缩进、截断），页面拿到的内容更全（前端自己做折叠）。
     """
 
@@ -47,13 +50,15 @@ class Console:
             print(title)
             print(line)
         if self.control and title:
-            self.control.emit(title, kind=kind, hr=True)
+            # 章节标题 / 退出提示都是脚本写的流程旁白，不是模型说的话，统一归「旁白」
+            self.control.emit(title, kind=kind, hr=True, role="log")
 
-    def say(self, body: str, kind: str = "system", indent: int = 2) -> None:
+    def say(self, body: str, kind: str = "system", indent: int = 2,
+            role: str = "log") -> None:
         body = "" if body is None else str(body)
         print(textwrap.indent(body, " " * indent) if indent else body)
         if self.control:
-            self.control.emit(body, kind=kind)
+            self.control.emit(body, kind=kind, role=role)
 
 
 def open_log():
@@ -305,10 +310,10 @@ def run_session(
                         for i, item in enumerate(items, 1):
                             if not item:
                                 continue
-                            con.say(f"{i}. {item['task']}", kind="plan")
+                            con.say(f"{i}. {item['task']}", kind="plan", role="prompt")
                             con.say(
                                 f"   验收: {item.get('verify') or '(未给出可执行标准，由验收 agent 自行设计)'}",
-                                kind="plan",
+                                kind="plan", role="prompt",
                             )
                         current_task = (update.get("current") or {}).get("task", "")
                         _w(logf, "=" * 70)
@@ -357,7 +362,7 @@ def run_session(
                         )
                         body = _clip(update.get("last_output") or update.get("last_error") or "")
                         con.say(f"{update.get('last_duration', 0)}s\n{body or '(无输出)'}",
-                                kind="worker")
+                                kind="worker", role="output")
                         _w(logf, "=" * 70)
                         _w(logf, f"[worker] 执行 第 {done + 1} 条 第 {update.get('attempts', 1)} 轮"
                                  f"（{update.get('last_duration', 0)}s）")
@@ -380,7 +385,8 @@ def run_session(
                         continue
                     passed = update.get("verdict_passed")
                     con.hr(f"[verifier] 验收 → {'PASS' if passed else 'FAIL'}", kind="verifier")
-                    con.say(_clip(update.get("verdict_reason", "")) or "(无)", kind="verifier")
+                    con.say(_clip(update.get("verdict_reason", "")) or "(无)", kind="verifier",
+                            role="output")
                     _w(logf, "=" * 70)
                     _w(logf, f"[verifier] 验收 → {'PASS' if passed else 'FAIL'}")
                     _w(logf, "结论: " + update.get("verdict_reason", ""))
@@ -397,7 +403,7 @@ def run_session(
         drained = bool(final.get("abort") or final.get("draining"))
 
         con.hr("[主 agent] 最终答复", kind="synth")
-        con.say(answer or "(空)", kind="synth", indent=0)
+        con.say(answer or "(空)", kind="synth", indent=0, role="output")
         _w(logf, "=" * 70)
         _w(logf, "[主 agent] 最终答复")
         _w(logf, answer or "(空)")
@@ -500,12 +506,15 @@ class Runner:
         worker_model: str | None = None,
         verifier_model: str | None = None,
         workdir: str | None = None,
+        seed_notes: list[dict] | None = None,
     ) -> dict:
         """开始一次运行。
 
         worker_model / verifier_model 传 None 表示沿用配置里的值，传空字符串表示
         「显式用 CLI 默认模型」—— 页面上那个「默认」选项就是后者。
         workdir 同理：None 或空串 = 回到配置里的默认产出目录，否则作为本次的工作目录。
+        seed_notes 是「开跑前就写好的引导」：reset 会清空信箱，所以在这里补投，
+        保证续跑的第一个节点（第一条模型调用）就能取到。
         一次只跑一个，所以直接改 cfg 上这几个字段是安全的。
         """
         goal = (goal or "").strip()
@@ -523,6 +532,11 @@ class Runner:
                 f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}"
             )
             self.control.reset()
+            for note in seed_notes or []:
+                target = str(note.get("target") or "main")
+                text = str(note.get("text") or "").strip()
+                if text and target in Control.TARGETS:
+                    self.control.push_note(target, text)
             self._session = {
                 "goal": goal, "thread": tid, "state": "running",
                 "code": None, "started": time.time(), "ended": 0.0, "error": "",

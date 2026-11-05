@@ -514,6 +514,7 @@ def run_worker(
     cwd: Path,
     feedback: str = "",
     guidance: str = "",
+    on_prompt: Callable[[str], None] | None = None,
     **kwargs,
 ) -> CliResult:
     """worker agent：干活。
@@ -534,6 +535,8 @@ def run_worker(
     prompt = WORKER_PROMPT.format(
         cwd=Path(cwd).expanduser().resolve(), task=task, feedback=extra, guidance=guide
     )
+    if on_prompt is not None:
+        on_prompt(prompt)   # 页面要把「这次调用真正收到的 prompt」原样打出来
     return run_cli(prompt, cwd=cwd, **kwargs)
 
 
@@ -545,6 +548,7 @@ def run_verifier(
     cwd: Path,
     scratch: Path | None = None,
     max_retries: int = 0,
+    on_prompt: Callable[[str], None] | None = None,
     **kwargs,
 ) -> Verdict:
     """验收 agent：自己写 test 脚本自己跑，判定是否达标。
@@ -567,6 +571,8 @@ def run_verifier(
         verify=criteria,
         worker_output=_clip(worker_output, 1500) or "(无输出)",
     )
+    if on_prompt is not None:
+        on_prompt(prompt)   # 重试时 prompt 不变，只打一次
     extra_dirs = [workdir] + list(kwargs.pop("add_dirs", []) or [])
 
     result: CliResult | None = None

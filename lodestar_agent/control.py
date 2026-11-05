@@ -98,9 +98,13 @@ class Control:
         self._started = time.time()
 
     # ── 事件 ──────────────────────────────────────────────
-    def emit(self, text: str, kind: str = "system", **meta) -> dict:
-        """kind: system / plan / worker / verifier / synth / stop"""
-        return self.bus.publish({"type": "log", "kind": kind, "text": text, "meta": meta})
+    def emit(self, text: str, kind: str = "system", role: str = "log", **meta) -> dict:
+        """kind: system / plan / worker / verifier / synth / stop
+        role: head（段落标题）/ prompt（派给节点的任务与验收）/ output（节点产出）/ log（旁白）/ guide（引导）
+        """
+        return self.bus.publish({
+            "type": "log", "kind": kind, "text": text, "meta": {**meta, "role": role},
+        })
 
     def status(self, state: str, detail: str = "") -> dict:
         """state: starting / running / busy / draining / done / aborted / failed"""
@@ -231,6 +235,7 @@ class Control:
         self.emit(
             f"收到给{'主 agent' if target == 'main' else 'worker'}的引导：{text}",
             kind="note",
+            role="guide",
             note_id=note["id"],
         )
         self.status("busy" if self._busy else "running", self._stage)

@@ -131,7 +131,7 @@ export function Sidebar({
                     return (
                       <li key={item.thread}>
                         <button
-                          className={`hi${selected === item.thread ? ' on' : ''}`}
+                          className={`hi${selected === item.thread ? ' on' : ''}${running ? ' current' : ''}`}
                           onClick={() => onSelect(item.thread)}
                           title={`${goal}\n${timeAgo(item.started)} · ${stateText}\n${item.thread}`}
                         >

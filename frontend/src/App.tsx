@@ -18,6 +18,7 @@ import { GuidePanel } from './components/GuidePanel';
 import { QuitPanel } from './components/QuitPanel';
 import { ConfigDialog } from './components/ConfigDialog';
 import { HistoryView } from './components/HistoryView';
+import { ResumePanel, type ResumeModels, type SeedNote } from './components/ResumePanel';
 
 const EMPTY_SUMMARY: TaskSummary = { total: 0, done: 0, passed: 0, failed: 0 };
 const EMPTY_HISTORY: HistoryGroups = { ok: true, total: 0, projects: [] };
@@ -45,6 +46,8 @@ export default function App() {
   const [history, setHistory] = useState<HistoryGroups>(EMPTY_HISTORY);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [selected, setSelected] = useState<string | null>(null);
+  // 「准备续跑」的会话：从历史点进来先挂在这里，确认之后才真正开跑
+  const [resumeDraft, setResumeDraft] = useState<HistoryDetail | null>(null);
   const [detail, setDetail] = useState<HistoryDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState('');
@@ -79,7 +82,8 @@ export default function App() {
       case 'log':
         setEvents((prev) => {
           const next = [...prev, {
-            seq: ev.seq, ts: ev.ts, kind: ev.kind, text: ev.text, hr: ev.meta?.hr,
+            seq: ev.seq, ts: ev.ts, kind: ev.kind, text: ev.text,
+            hr: ev.meta?.hr, role: ev.meta?.role,
           }];
           return next.length > 2500 ? next.slice(next.length - 2500) : next;
         });
@@ -103,6 +107,7 @@ export default function App() {
           setForceLaunch(false);
           setDrainStart(null);
           setSelected(null);
+          setResumeDraft(null);
           void refreshHistory();
         } else {
           void refreshHistory();
@@ -167,8 +172,6 @@ export default function App() {
     const res = await command({
       type: 'run',
       goal: payload.goal,
-      thread: payload.thread || null,
-      resume: payload.resume,
       worker_model: payload.workerModel,
       verifier_model: payload.verifierModel,
       workdir: payload.workdir || null,
@@ -178,6 +181,7 @@ export default function App() {
     if (res.session.workdir) setWorkdir(res.session.workdir);
     setForceLaunch(false);
     setSelected(null);
+    setResumeDraft(null);
     void refreshHistory();
     return null;
   }, [refreshHistory]);
@@ -218,6 +222,14 @@ export default function App() {
   }, []);
 
   const openHistory = useCallback(async (thread: string) => {
+    // 正在跑的这一条没有「只读历史」可看：它的界面就是当前操作界面。
+    // 点它必须回到运行视图，否则会卡在历史预览里，回不到输入框和事件流。
+    if (session.state === 'running' && thread === session.thread) {
+      setSelected(null);
+      setDetail(null);
+      setDetailError('');
+      return;
+    }
     setSelected(thread);
     setDetail(null);
     setDetailError('');
@@ -231,7 +243,7 @@ export default function App() {
     } finally {
       setDetailLoading(false);
     }
-  }, []);
+  }, [session.state, session.thread]);
 
   const closeHistory = useCallback(() => {
     setSelected(null);
@@ -239,34 +251,55 @@ export default function App() {
     setDetailError('');
   }, []);
 
-  // 从历史续跑：不传模型，沿用当前配置（避免把「默认」误当成显式覆盖）
-  const resumeFromHistory = useCallback(async (item: HistoryDetail) => {
+  // 从历史「继续这个会话」= 只回到操作界面，把这条挂成待续跑，不立即开跑。
+  // 真正启动在操作页面下方的续跑条里点，且要点两次（二次确认）。
+  const prepareResume = useCallback((item: HistoryDetail) => {
+    setResumeDraft(item);
+    setSelected(null);
+    setDetail(null);
     setDetailError('');
-    const res = await command({
+    setForceLaunch(false);
+    setDetailLoading(false);
+  }, []);
+
+  // 真续跑：不传模型，沿用当前配置（避免把「默认」误当成显式覆盖）。
+  // guide 是开跑前写好的引导，跟 run 一起送过去 —— 后端在 reset 之后立刻补投，
+  // 所以续跑的第一个节点就能看到它。
+  const resumeFromHistory = useCallback(async (
+    item: HistoryDetail, guide: SeedNote | null, models: ResumeModels,
+  ): Promise<string | null> => {
+    setDetailError('');
+    const payload: Record<string, unknown> = {
       type: 'run',
       goal: item.goal,
       thread: item.thread,
       resume: true,
       workdir: item.workdir || null,
-    });
-    if (!res.ok || !res.session) {
-      setDetailError(res.error ?? '续跑失败');
-      return;
-    }
+      seed_notes: guide ? [guide] : [],
+    };
+    // 字段缺省才叫「沿用配置」；传空串是显式指定 CLI 默认模型，两种语义别混
+    if (models.worker !== undefined) payload.worker_model = models.worker;
+    if (models.verifier !== undefined) payload.verifier_model = models.verifier;
+    const res = await command(payload);
+    if (!res.ok || !res.session) return res.error ?? '续跑失败';
     setSession(res.session);
     setSelected(null);
+    setResumeDraft(null);
     setForceLaunch(false);
     void refreshHistory();
+    return null;
   }, [refreshHistory]);
 
   const useAsNew = useCallback((item: HistoryDetail) => {
     setPreset({ goal: item.goal, workdir: item.workdir, n: Date.now() });
     setSelected(null);
+    setResumeDraft(null);
     setForceLaunch(true);
   }, []);
 
   const newTask = useCallback(() => {
     setSelected(null);
+    setResumeDraft(null);
     setForceLaunch(true);
   }, []);
 
@@ -304,7 +337,7 @@ export default function App() {
                 loading={detailLoading}
                 error={detailError}
                 running={session.state === 'running'}
-                onResume={(item) => void resumeFromHistory(item)}
+                onResume={prepareResume}
                 onUseAsNew={useAsNew}
                 onClose={closeHistory}
               />
@@ -323,26 +356,40 @@ export default function App() {
                 )}
 
                 <div className="composer-zone">
-                  <LaunchPanel
-                    meta={meta}
-                    running={session.state === 'running'}
-                    defaultWorkdir={workdir || meta.workdir}
-                    preset={preset}
-                    onStart={start}
-                    onGuide={(text) => sendNote('main', text)}
-                    guideLocked={status.state === 'draining' || drainStart !== null}
-                  />
+                  {/* 有待续跑的会话时，这里不摆新任务表单：
+                      没开跑之前的输入框既开不了新任务（会和续跑打架），也发不出引导
+                      （引导是投进运行中的实例，开始运行那一刻会被 reset 清空）。
+                      跑起来之后才切成引导框。 */}
+                  {resumeDraft ? (
+                    <ResumePanel
+                      item={resumeDraft}
+                      meta={meta}
+                      /* 上次运行用过的模型比启动时的 meta 更新：Runner.start 会改 cfg */
+                      current={{
+                        worker: session.workerModel || meta.workerModel,
+                        verifier: session.verifierModel || meta.verifierModel,
+                      }}
+                      running={session.state === 'running'}
+                      onResume={resumeFromHistory}
+                      onNewTask={() => useAsNew(resumeDraft)}
+                    />
+                  ) : (
+                    <LaunchPanel
+                      meta={meta}
+                      running={session.state === 'running'}
+                      defaultWorkdir={workdir || meta.workdir}
+                      preset={preset}
+                      onStart={start}
+                      onGuide={sendNote}
+                      guideLocked={status.state === 'draining' || drainStart !== null}
+                      pending={status.pending}
+                    />
+                  )}
                 </div>
 
                 <aside>
                   <TaskPanel tasks={tasks} summary={summary} />
-                  <GuidePanel
-                    notes={notes}
-                    status={status}
-                    disabled={status.state === 'draining'
-                      || ['done', 'failed', 'aborted', 'error'].includes(session.state)}
-                    onSend={sendNote}
-                  />
+                  <GuidePanel notes={notes} />
                   <QuitPanel
                     status={status}
                     session={session}

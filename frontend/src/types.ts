@@ -82,12 +82,16 @@ export interface Status {
 
 export type LogKind = 'system' | 'plan' | 'worker' | 'verifier' | 'synth' | 'stop' | 'note';
 
+/** 这一条属于哪一类内容：标题 / 派给节点的 prompt / 节点输出 / 旁白 / 引导 */
+export type LogRole = 'head' | 'prompt' | 'output' | 'log' | 'guide';
+
 export interface LogEvent {
   seq: number;
   ts: number;
   kind: LogKind;
   text: string;
   hr?: boolean;
+  role?: LogRole;
 }
 
 export type TaskStatus = 'pending' | 'running' | 'pass' | 'fail' | 'skip';
@@ -142,7 +146,7 @@ export interface StateSnapshot extends Status {
 }
 
 export type ServerEvent =
-  | ({ type: 'log' } & LogEvent & { meta?: { hr?: boolean } })
+  | ({ type: 'log' } & LogEvent & { meta?: { hr?: boolean; role?: LogRole } })
   | ({ type: 'status' } & Status & { seq: number; ts: number })
   | {
     type: 'session'; state: SessionState; goal?: string; thread?: string;

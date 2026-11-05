@@ -157,6 +157,17 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
             worker_model = payload.get("worker_model")
             verifier_model = payload.get("verifier_model")
             workdir = payload.get("workdir")
+            # 续跑前写好的引导：跟这次 run 一起投进信箱（开跑那一刻不会被 reset 冲掉）
+            seed_notes: list[dict] = []
+            raw_seed = payload.get("seed_notes")
+            if isinstance(raw_seed, list):
+                for item in raw_seed[:4]:
+                    if not isinstance(item, dict):
+                        continue
+                    target = str(item.get("target") or "main").strip()
+                    text = str(item.get("text") or "").strip()
+                    if target in Control.TARGETS and text:
+                        seed_notes.append({"target": target, "text": text[:4000]})
             if not goal and not resume:
                 return JSONResponse({"ok": False, "error": "目标不能为空"}, status_code=400)
             try:
@@ -165,6 +176,7 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
                     worker_model=None if worker_model is None else str(worker_model),
                     verifier_model=None if verifier_model is None else str(verifier_model),
                     workdir=None if workdir is None else str(workdir),
+                    seed_notes=seed_notes,
                 )
             except RuntimeError as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)

@@ -59,7 +59,9 @@ export function HistoryView({
           <button
             className="primary"
             disabled={!canResume}
-            title={running ? '当前有任务在运行' : (canResume ? '' : '没有可续跑的断点')}
+            title={running
+              ? '当前有任务在运行'
+              : (canResume ? '回到操作界面，确认后才开始跑' : '没有可续跑的断点')}
             onClick={() => onResume(detail)}
           >
             继续这个会话
@@ -67,9 +69,11 @@ export function HistoryView({
           <button className="ghost" disabled={running} onClick={() => onUseAsNew(detail)}>
             在此目录新建任务
           </button>
-          {!canResume && !running && (
-            <span className="hist-action-tip">没有可续跑的断点；可以复制目标重新开一个</span>
-          )}
+          {canResume
+            ? <span className="hist-action-tip">先回到操作界面，在下方确认后才开始跑</span>
+            : !running && (
+              <span className="hist-action-tip">没有可续跑的断点；可以复制目标重新开一个</span>
+            )}
         </div>
 
         <h2 className="hist-h2">
