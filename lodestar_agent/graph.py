@@ -127,6 +127,9 @@ PLAN_INIT_PROMPT = """你是主 agent，负责把用户目标拆成「任务方�
 
 每个子任务：
 - task：worker 能直接照着做，写清文件路径和要做什么；文件路径一律写相对于工作目录的路径，或直接用工作目录下的子目录，不要写 /workspace、/tmp 之类与工作目录无关的绝对路径
+- 粒度：单条要能在一次 CLI 执行内做完（约 5 分钟、几十轮工具调用）。要跑大循环、长测试、
+  或「写完再修一堆缺陷」的，拆成两条（先写脚本/补实现 → 再跑测试修缺陷），
+  否则 worker 会因为超时被反复切断，反而更慢
 - verify：验收 agent 能照着跑的检查，必须是可执行的，三种任选其一
   ① 文件存在，且包含指定字符串
   ② 运行命令 <cmd> 退出码为 0，且输出包含 "<期望字符串>"
@@ -220,6 +223,7 @@ class State(TypedDict, total=False):
     records: Annotated[list[dict], operator.add]
     abort: bool               # 被兜底强杀（超时上限）或跳过：当前任务不完整
     abort_reason: str
+    worker_session: str       # 上一次 worker CLI 的 session_id（超时重试时用它续跑）
     draining: bool            # 边界退出：当前这一轮已经跑完，只是不再开新的
     aborted_task: dict        # 被中断的那条任务，供 --resume 时接着做
     aborted_stage: str        # 中断时「接下来本该做什么」：worker / verify / done
@@ -464,10 +468,13 @@ def build_graph(cfg: Config, use_llm: bool = True, llm=None, checkpointer=None,
             return {
                 "action": "dispatch", "stage": "round", "current": nxt, "plan": rest,
                 "attempts": 0, "feedback": "", "records": [record], "note": note,
+                # 新任务新会话：别让它续跑到上一条任务的上下文里
+                "worker_session": "", "last_error": "",
             }
         return {
             "action": "done", "stage": "round", "current": None, "plan": [],
             "attempts": 0, "feedback": "", "records": [record], "note": note,
+            "worker_session": "", "last_error": "",
         }
 
     def _drain(state: State, current: dict | None, plan: list[dict]) -> dict:
@@ -534,7 +541,8 @@ def build_graph(cfg: Config, use_llm: bool = True, llm=None, checkpointer=None,
                         "note": "没有可执行的任务", "plan_raw": plan_raw}
             nxt, rest = plan[0], plan[1:]
             return {"action": "dispatch", "stage": "init", "current": nxt, "plan": rest,
-                    "attempts": 0, "feedback": "", "note": note, "plan_raw": plan_raw}
+                    "attempts": 0, "feedback": "", "note": note, "plan_raw": plan_raw,
+                    "worker_session": "", "last_error": ""}
 
         # ── 之后每轮：读产出 + 验收结果，动态规划 ──
         records = state.get("records") or []
@@ -578,7 +586,9 @@ def build_graph(cfg: Config, use_llm: bool = True, llm=None, checkpointer=None,
                 return _drain(state, current, plan)
             return {"action": "dispatch", "stage": "round", "current": current, "plan": plan,
                     "attempts": attempts, "feedback": feedback, "records": [],
-                    "note": "验收不通过，打回重做", "decision_raw": decision_raw}
+                    "note": "验收不通过，打回重做", "decision_raw": decision_raw,
+                    # 验收打回是「换个方向改」，新会话更干净；续跑只用于执行失败/超时
+                    "worker_session": "", "last_error": ""}
 
         # 通过 / 验收轮次耗尽 → 定稿，动态修订剩余方案
         revised = plan
@@ -632,6 +642,12 @@ def build_graph(cfg: Config, use_llm: bool = True, llm=None, checkpointer=None,
         notes = control.take_notes("worker") if control is not None else []
         guidance = "\n".join(f"- {n['text']}" for n in notes)
 
+        # 上一次是执行失败 / 超时，且已经拿到了 CLI 会话 id → 在同一个会话里续跑。
+        # 否则每轮都是全新会话，同一份活重做三遍，永远做不完（超时→重试→再超时的根源）。
+        resume_session = ""
+        if state.get("last_error") and state.get("worker_session"):
+            resume_session = str(state["worker_session"])
+
         if control is not None:
             control.set_busy(
                 "worker",
@@ -646,6 +662,7 @@ def build_graph(cfg: Config, use_llm: bool = True, llm=None, checkpointer=None,
                 cwd=cfg.worker.workdir,
                 feedback=state.get("feedback", ""),
                 guidance=guidance,
+                resume_session=resume_session,
                 on_prompt=lambda text: _emit_prompt("worker", "worker(执行)", text),
                 cli=cfg.worker.cli,
                 model=cfg.worker.model,
@@ -667,6 +684,8 @@ def build_graph(cfg: Config, use_llm: bool = True, llm=None, checkpointer=None,
             "last_error": result.error or "",
             "last_duration": round(result.duration, 1),
             "verdict_ready": False,
+            # 记下来会话 id：下一轮如果是超时/失败重试，就在这个会话里接着跑
+            "worker_session": result.session_id or str(state.get("worker_session") or ""),
         }
         if result.aborted:
             # 等超了上限才被强杀：这一轮产出不可信，resume 时重跑

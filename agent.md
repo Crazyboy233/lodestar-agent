@@ -89,7 +89,8 @@ START → plan ─┬─ dispatch ─► worker → verify ─┐
 | 约束 | 为什么 |
 | --- | --- |
 | 子进程只继承**白名单**环境变量 | 宿主（WorkBuddy / IDE）注入的 `CODEBUDDY_*`、`SERVER__PORT`、`BAGGAGE` 会让嵌套 CLI 走进另一套认证，直接报 `Authentication required`；`SERVER__PORT` 还会抢端口 `EADDRINUSE` |
-| `--output-format json` 按**两种形态**解析 | 实际返回消息数组，`result` 在最后一项（文档示例是对象）。`_parse_json` / `_pick_result` 都兼容 |
+| `--output-format stream-json`（逐行事件流） | 不用 `json`：它把整段 transcript（含每轮的 memory 注入）序列化成一个巨型对象，几百 KB 起，一旦中途断掉整段不可解析。`stream-json` 一行一个事件，末行被截断也只丢那一行；`result` 事件里带 `session_id` 和最终文本 |
+| stdout/stderr **重定向到文件**，不走管道 | CLI 是 Node 程序，stdout 接管道时是异步写，`process.exit(0)` 会丢掉没 flush 的部分（实测 8MB 只收到 65536 字符，退出码仍是 0）。文件描述符是同步写；被强杀也能读到已落盘的部分 |
 | 必须匹配 `Authentication required` 字符串 | 未登录时退出码**仍是 0**，错误只在 stderr，只看 returncode 会误判成功 |
 | 失败输出压成一句话（`_diagnose`，上限 400 字） | 否则会把整段 transcript 倒进终端 |
 | `-p` 模式要关后台任务、必带 `-y` | 单发模式不支持后台任务（`CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS=1`）；不带 `-y` 文件写入和命令执行会被权限拦下 |
@@ -111,7 +112,7 @@ START → plan ─┬─ dispatch ─► worker → verify ─┐
 语义：**当前这一次模型回复跑完再说，下一个模型回复开始前收工**。目标是退出时手上不留半成品。
 
 - `request_stop()` 只置 `threading.Event` + 记 `drain_deadline = now + ui.drain_timeout_seconds`，不碰任何进程。
-- `run_cli` 每 0.25s 轮询：`cancel` 被置位**不会**打断已经发出去的那一轮（这才叫边界）；只有 `now >= drain_deadline` 才 `_terminate_tree`（POSIX SIGTERM → SIGKILL；Windows `taskkill /T /F`），返回 `aborted=True`，那是兜底路径。
+- `run_cli` 每 0.2s 轮询 `proc.poll()`：`cancel` 被置位**不会**打断已经发出去的那一轮（这才叫边界）；只有 `now >= drain_deadline` 才 `_terminate_tree`（POSIX SIGTERM → SIGKILL；Windows `taskkill /T /F`），返回 `aborted=True`，那是兜底路径。
 - 节点边界分入口 / 出口两种处理：
   - 入口见 stop → 这次调用根本不启动（`aborted_stage=worker`）；
   - 出口见 stop → 这一轮已跑完，标 `draining=True`（worker 出口记 `aborted_stage=verify`，verify 出口记 `done`）。
@@ -126,7 +127,7 @@ START → plan ─┬─ dispatch ─► worker → verify ─┐
 
 1. `_terminate_tree` 的 pgid 用 `proc.pid`（`start_new_session=True` 保证它是 leader），不用 `os.getpgid` —— 后者在进程刚退出时抛 `ProcessLookupError`，那条分支只 kill 主进程，会漏掉组里还活着的孙进程。
 2. SIGTERM 之后**无论主进程退没退**，都再对整组补一次 SIGKILL：主进程死了不代表孙进程死了。
-3. `_drain_pipes` 给 `communicate()` 加超时：孙进程攥着 stdout pipe 时，无超时的 communicate 会永久阻塞，表现为「点了退出但进程一直不退」。
+3. stdout/stderr 落文件而不是管道，**不再需要 `communicate()` 的收尾超时**：孙进程攥着管道、无超时读取会永久阻塞的那个坑，从根上消失了。被强杀后直接读文件，能拿到中断前的产出。
 4. 主 agent 走 `llm.stream()`（`_invoke_interruptible`），到点 `gen.close()` 断连；非流式做不到真正停止生成。`_call_llm` 遇到 `ModelAborted` 不重试。
 
 另外 `drain_deadline` 必须传**回调**而不是常量：退出请求通常发生在 CLI 已经跑起来之后，进入 `run_cli` 时还求不出来；传死值会让强杀分支永远不触发。

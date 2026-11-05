@@ -29,7 +29,7 @@ class WorkerConfig:
     cli: str = "codebuddy"
     model: str = ""
     workdir: Path = Path("./workspace")
-    timeout_seconds: float = 300.0
+    timeout_seconds: float = 600.0
     allowed_tools: str = "Read,Write,Edit,Bash"
     add_dirs: list[Path] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
@@ -146,7 +146,7 @@ def load_config(path: str | Path = "config.yaml") -> Config:
         cli=str(worker_raw.get("cli") or "codebuddy"),
         model=str(worker_raw.get("model") or ""),
         workdir=workdir,
-        timeout_seconds=float(worker_raw.get("timeout_seconds", 300)),
+        timeout_seconds=float(worker_raw.get("timeout_seconds", 600)),
         allowed_tools=str(worker_raw.get("allowed_tools") or "Read,Write,Edit,Bash"),
         add_dirs=add_dirs,
         env={str(k): str(v) for k, v in (worker_raw.get("env") or {}).items()},

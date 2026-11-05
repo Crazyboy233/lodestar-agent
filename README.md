@@ -344,7 +344,7 @@ worker 跑完只差验收的，直接补验收不重跑；worker 还没开始的
 | --- | --- | --- |
 | 单条子任务的往复次数 | `verifier.max_rounds`（默认 3） | 判失败，记入汇总，继续下一条 |
 | 单次 CLI 内部轮数 | `worker.max_turns`（默认 0 = 不传参，用 CLI 默认；非交互模式是 500） | CLI 自己停下并报 `Max turns (N) exceeded`；页面会提示怎么放宽 |
-| 单次调用墙钟 | `worker/verifier.timeout_seconds` | 终止**整棵子进程树**（POSIX 进程组 SIGTERM→SIGKILL；Windows `taskkill /T /F`） |
+| 单次调用墙钟 | `worker/verifier.timeout_seconds`（worker 默认 600） | 终止**整棵子进程树**（POSIX 进程组 SIGTERM→SIGKILL；Windows `taskkill /T /F`）；中断前已产出的内容会保留并交给验收。重试时用 `--resume` 接着同一个 CLI 会话跑，不从零重做 |
 | 图节点总步数 | `recursion_limit=120` | 兜底防图本身打转 |
 | 主 agent 模型请求失败 | `main_agent.max_retries`（默认 3） | 重试耗尽 → 终止流程，报失败节点+原因 |
 | 拆解输出解析失败 | `main_agent.plan_retries`（默认 2） | 带纠正提示重试；用尽则退化为单任务 |
