@@ -1,5 +1,15 @@
 export type SessionState = 'idle' | 'running' | 'done' | 'failed' | 'aborted' | 'error';
 
+/** 一个节点这次运行实际用的来源与模型 */
+export interface NodeInfo {
+  source: string;
+  model: string;
+  /** 展示用：「来源 · 模型」 */
+  label: string;
+}
+
+export type NodeId = 'main' | 'worker' | 'verifier';
+
 export interface Session {
   goal: string;
   thread: string;
@@ -8,8 +18,8 @@ export interface Session {
   started: number;
   ended: number;
   error: string;
-  workerModel?: string;
-  verifierModel?: string;
+  /** 三个节点各自用的来源 + 模型（没开跑时为空对象） */
+  nodes?: Partial<Record<NodeId, NodeInfo>>;
   workdir?: string;
 }
 
@@ -135,17 +145,24 @@ export interface NoteItem {
   consumed: boolean;
 }
 
+/** 一个可选的模型来源（HTTP 接口 / 某个本机 CLI） */
+export interface SourceInfo {
+  name: string;
+  kind: 'api' | 'cli';
+  /** chat = 能当纯文本模型；agent = 会读写文件、跑命令 */
+  capabilities: string[];
+  /** 下拉候选；空数组表示「型号自己填」 */
+  models: string[];
+  /** 接口地址或命令名，给人看的 */
+  display: string;
+}
+
 export interface RunMeta {
-  model: string;
-  base_url: string;
+  nodes: Record<NodeId, NodeInfo>;
+  sources: SourceInfo[];
   workdir: string;
-  worker: string;
-  verifier: string;
   max_rounds: number;
   drain_timeout: number;
-  models: string[];
-  workerModel: string;
-  verifierModel: string;
 }
 
 /** GET /state 的快照：Status 的超集 */
@@ -174,19 +191,19 @@ export type ServerEvent =
   | { type: 'reset'; seq: number }
   | { type: 'stop'; reason: string; busy: NodeName | null; busyDetail: string; drainTimeout: number };
 
+/** 设置弹窗的数据源：节点、来源、控制台三段，形状与 config.yaml 对齐 */
 export interface ConfigView {
-  main_agent: {
-    base_url: string;
-    api_key: string;
-    api_key_set: boolean;
-    model: string;
-    temperature: number;
-    max_retries: number;
-    plan_retries: number;
+  nodes: Record<NodeId, Record<string, string | number>>;
+  providers: {
+    name: string;
+    kind: 'api' | 'cli';
+    fields: Record<string, string | number | boolean>;
+  }[];
+  ui: {
+    drain_timeout_seconds: number;
+    /** 按来源分组的候选模型，每行一个 */
+    models: Record<string, string>;
   };
-  worker: Record<string, string | number>;
-  verifier: Record<string, string | number>;
-  ui: { drain_timeout_seconds: number; models: string };
 }
 
 export const EMPTY_STATUS: Status = {
@@ -217,15 +234,12 @@ export const EMPTY_SESSION: Session = {
   error: '',
 };
 
+const EMPTY_NODE: NodeInfo = { source: '', model: '', label: '' };
+
 export const EMPTY_META: RunMeta = {
-  model: '',
-  base_url: '',
+  nodes: { main: EMPTY_NODE, worker: EMPTY_NODE, verifier: EMPTY_NODE },
+  sources: [],
   workdir: '',
-  worker: '',
-  verifier: '',
   max_rounds: 3,
   drain_timeout: 120,
-  models: [''],
-  workerModel: '',
-  verifierModel: '',
 };

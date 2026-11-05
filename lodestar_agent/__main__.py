@@ -21,9 +21,9 @@ from pathlib import Path
 
 from .config import ConfigError, load_config
 from .control import Control
+from .providers import registry
 from .session import Runner, StartRequest, new_thread_id, run_session
 from .server import ConsoleServer
-from .worker import check_cli
 
 
 def _start_console(cfg, control: Control, runner: Runner, host: str | None,
@@ -32,17 +32,20 @@ def _start_console(cfg, control: Control, runner: Runner, host: str | None,
     bind_host = host or cfg.ui.host
     bind_port = cfg.ui.port if port is None else port
     meta = {
-        "model": cfg.main_agent.model,
-        "base_url": cfg.main_agent.base_url,
+        # 三个节点各自用哪个来源 + 哪个模型；页面据此渲染下拉的当前值
+        "nodes": {
+            name: {
+                "source": cfg.node(name).source,
+                "model": cfg.node(name).model,
+                "label": registry.label(cfg, cfg.node(name).source, cfg.node(name).model),
+            }
+            for name in ("main", "worker", "verifier")
+        },
+        # 可选来源清单：名字、类型、能选哪些模型
+        "sources": registry.sources(cfg),
         "workdir": str(cfg.worker.workdir),
-        "worker": f"{cfg.worker.cli} · {cfg.worker.model or '默认模型'}",
-        "verifier": f"{cfg.verifier.cli} · {cfg.verifier.model or '默认模型'}",
         "max_rounds": cfg.verifier.max_rounds,
         "drain_timeout": cfg.ui.drain_timeout_seconds,
-        # 页面下拉用：可选模型 + 当前配置值（空串 = CLI 默认）
-        "models": cfg.ui.models,
-        "workerModel": cfg.worker.model,
-        "verifierModel": cfg.verifier.model,
     }
     try:
         # bind 发生在 start() 里：端口被占用会在这里抛 OSError
@@ -126,20 +129,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.workdir:
         cfg.worker.workdir = Path(args.workdir).expanduser().resolve()
 
-    if not args.dry_run and not cfg.main_agent.api_key:
-        print(
-            "[配置错误] 没有 api_key：请在 config.local.yaml 的 main_agent.api_key 填写，"
-            "或设置环境变量 DEEPSEEK_API_KEY。",
-            file=sys.stderr,
-        )
+    # 启动自检：来源存在 / 能力匹配 / 该登录的登录 / 该有 key 的有 key。
+    # 一次把问题全报出来，不让用户改一个、重启、再撞下一个。
+    problems = registry.check(cfg, only=("worker", "verifier") if args.dry_run else None)
+    if problems:
+        for item in problems:
+            print(f"[配置错误] {item}", file=sys.stderr)
         return 2
-
-    for cli in {cfg.worker.cli, cfg.verifier.cli}:
-        try:
-            check_cli(cli)
-        except RuntimeError as exc:
-            print(f"[环境错误] {exc}", file=sys.stderr)
-            return 2
 
     control = Control(drain_timeout=cfg.ui.drain_timeout_seconds)
     config_path = Path(args.config).expanduser().resolve()

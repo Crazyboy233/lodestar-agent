@@ -30,6 +30,8 @@ from .control import Control
 from .errors import AgentFailure
 from .graph import build_graph
 from .history import HistoryStore
+from .providers import registry
+from .providers.base import ProviderError
 from .records import tasks_from_state
 from .view import Line, LogSink, Renderer
 from .worker import terminate_all_cli
@@ -38,7 +40,8 @@ from .worker import terminate_all_cli
 EMPTY_SESSION: dict = {
     "goal": "", "thread": "", "state": "idle", "code": None,
     "started": 0.0, "ended": 0.0, "error": "",
-    "workerModel": "", "verifierModel": "", "workdir": "",
+    # 每个节点这次实际用的「来源 + 模型」，页面据此显示「沿用 · xxx」
+    "nodes": {}, "workdir": "",
 }
 
 
@@ -57,7 +60,8 @@ def new_thread_id() -> str:
 class StartRequest:
     """一次运行的入参。None 与空串的区别是契约的一部分，别随手写成 `or ""`。
 
-    - `worker_model` / `verifier_model`：None = 沿用配置；"" = 显式用 CLI 默认模型
+    - `*_source` / `*_model`：None = 沿用配置；"" = 显式用该来源的默认模型。
+      三个节点各自独立，页面上想混搭就混搭（比如主 agent 走 API、worker 走 CLI）。
     - `workdir`：None / 空串 = 回到配置里的默认产出目录
     - `seed_notes`：开跑前写好的引导，在 `reset()` 之后补投（否则会被清空）
     """
@@ -65,7 +69,11 @@ class StartRequest:
     goal: str = ""
     thread: str | None = None
     resume: bool = False
+    main_source: str | None = None
+    main_model: str | None = None
+    worker_source: str | None = None
     worker_model: str | None = None
+    verifier_source: str | None = None
     verifier_model: str | None = None
     workdir: str | None = None
     seed_notes: tuple[dict, ...] = ()
@@ -201,7 +209,16 @@ def run_session(
     saver = SqliteSaver(conn)
     saver.setup()
 
-    app = build_graph(cfg, use_llm=not dry_run, checkpointer=saver, control=control)
+    try:
+        app = build_graph(cfg, use_llm=not dry_run, checkpointer=saver, control=control)
+    except ProviderError as exc:
+        # 来源没配好（缺 key / 缺 CLI / 能力不匹配）：在建图那一刻就报，别让它跑到一半才炸
+        con.hr("[流程终止] 模型来源不可用", kind="stop")
+        con.say(str(exc), kind="stop")
+        control.status("failed", str(exc))
+        control.emit(f"流程终止：{exc}", kind="stop")
+        conn.close()
+        return int(ExitCode.SETUP)
     run_config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 120}
 
     logf = None
@@ -237,7 +254,8 @@ def run_session(
         # 历史记录在这里落盘：此时 goal 已按续跑规则修正过，workdir 也已定
         store.begin(
             thread_id, goal, str(cfg.worker.workdir),
-            worker_model=cfg.worker.model, verifier_model=cfg.verifier.model,
+            worker_model=registry.label(cfg, cfg.worker.source, cfg.worker.model),
+            verifier_model=registry.label(cfg, cfg.verifier.source, cfg.verifier.model),
             dry_run=dry_run, resume=resume, log_path=str(log_path),
         )
         hist_thread = thread_id
@@ -276,6 +294,18 @@ def run_session(
             control.status("failed" if renderer.failed else "done")
             code = int(ExitCode.FAILED) if renderer.failed else int(ExitCode.OK)
 
+    except ProviderError as exc:
+        # 来源配错了（没装 CLI / 没 key / 能力不匹配）：这不是「跑挂」，是「没配好」
+        con.hr("[流程终止] 模型来源不可用", kind="stop")
+        con.say(str(exc), kind="stop")
+        if logf:
+            _w(logf, logfmt.LOG_RULE)
+            _w(logf, "[流程终止] 模型来源不可用")
+            _w(logf, str(exc))
+        control.status("failed", str(exc))
+        control.emit(f"流程终止：{exc}", kind="stop")
+        hist_error = f"来源不可用: {exc}"
+        code = int(ExitCode.SETUP)
     except AgentFailure as exc:
         con.hr("[流程终止] 模型请求失败", kind="stop")
         con.say(f"失败节点: {exc.node}", kind="stop")
@@ -329,12 +359,12 @@ def _write_header(logf, cfg: Config, goal: str, thread_id: str, db_path: Path,
     _w(logf, f"checkpoint: {db_path}")
     if resume_note:
         _w(logf, logfmt.field("resume", resume_note))
-    _w(logf, f"主 agent: {cfg.main_agent.model} @ {cfg.main_agent.base_url}")
-    _w(logf, f"worker: {cfg.worker.cli} (model={cfg.worker.model or 'CLI 默认'}, "
-             f"tools={cfg.worker.allowed_tools}, cwd={cfg.worker.workdir}, "
-             f"max_turns={cfg.worker.max_turns or 'CLI 默认'})")
-    _w(logf, f"验收: {cfg.verifier.cli} (model={cfg.verifier.model or 'CLI 默认'}, "
-             f"tools={cfg.verifier.allowed_tools}, "
+    _w(logf, f"主 agent: {registry.label(cfg, cfg.main.source, cfg.main.model)}")
+    _w(logf, f"worker: {registry.label(cfg, cfg.worker.source, cfg.worker.model)} "
+             f"(tools={cfg.worker.allowed_tools}, cwd={cfg.worker.workdir}, "
+             f"max_turns={cfg.worker.max_turns or '默认'})")
+    _w(logf, f"验收: {registry.label(cfg, cfg.verifier.source, cfg.verifier.model)} "
+             f"(tools={cfg.verifier.allowed_tools}, "
              f"cwd={cfg.worker.workdir}/{cfg.verifier.scratch_dir}, "
              f"max_rounds={cfg.verifier.max_rounds})")
     _w(logf, "")
@@ -343,15 +373,15 @@ def _write_header(logf, cfg: Config, goal: str, thread_id: str, db_path: Path,
 def _say_header(con: Console, cfg: Config, goal: str, thread_id: str,
                 resume: bool, dry_run: bool) -> None:
     con.say(f"目标    : {goal}", indent=0)
-    con.say(f"主 agent: {cfg.main_agent.model} @ {cfg.main_agent.base_url}", indent=0)
+    con.say(f"主 agent: {registry.label(cfg, cfg.main.source, cfg.main.model)}", indent=0)
     con.say(
-        f"worker  : {cfg.worker.cli} (model={cfg.worker.model or 'CLI 默认'}, "
-        f"cwd={cfg.worker.workdir})",
+        f"worker  : {registry.label(cfg, cfg.worker.source, cfg.worker.model)} "
+        f"(cwd={cfg.worker.workdir})",
         indent=0,
     )
     con.say(
-        f"验收    : {cfg.verifier.cli} (model={cfg.verifier.model or 'CLI 默认'}, "
-        f"max_rounds={cfg.verifier.max_rounds})",
+        f"验收    : {registry.label(cfg, cfg.verifier.source, cfg.verifier.model)} "
+        f"(max_rounds={cfg.verifier.max_rounds})",
         indent=0,
     )
     if dry_run:
@@ -397,10 +427,7 @@ class Runner:
         with self._lock:
             if self._thread and self._thread.is_alive():
                 raise RuntimeError("已有任务在运行，先等它结束或先点边界退出")
-            if req.worker_model is not None:
-                self.cfg.worker.model = req.worker_model.strip()
-            if req.verifier_model is not None:
-                self.cfg.verifier.model = req.verifier_model.strip()
+            self._apply_overrides(req)
             self.cfg.worker.workdir = self._resolve_workdir(req.workdir)
             tid = req.thread or new_thread_id()
             self.control.reset()
@@ -411,8 +438,7 @@ class Runner:
                 EMPTY_SESSION,
                 goal=req.goal, thread=tid, state="running",
                 started=time.time(),
-                workerModel=self.cfg.worker.model,
-                verifierModel=self.cfg.verifier.model,
+                nodes=self._node_info(),
                 workdir=str(self.cfg.worker.workdir),
             )
             info = dict(self._session)
@@ -424,6 +450,36 @@ class Runner:
         self.control.session_event("running", goal=req.goal, thread=tid,
                                    workdir=str(self.cfg.worker.workdir))
         return info
+
+    def _apply_overrides(self, req: StartRequest) -> None:
+        """把页面这次的选择写回 cfg。None = 不动配置，"" = 显式用该来源的默认模型。"""
+        for name, source, model in (
+            ("main", req.main_source, req.main_model),
+            ("worker", req.worker_source, req.worker_model),
+            ("verifier", req.verifier_source, req.verifier_model),
+        ):
+            node = self.cfg.node(name)
+            if source is not None:
+                src = source.strip()
+                if src and src not in self.cfg.providers:
+                    known = "、".join(self.cfg.providers) or "（无）"
+                    raise ValueError(f"{name} 的来源 {src} 不存在（已配置：{known}）")
+                if src:
+                    node.source = src
+            if model is not None:
+                node.model = model.strip()
+
+    def _node_info(self) -> dict:
+        """这次运行三个节点各自用的来源与模型（页面「沿用 · xxx」显示它）。"""
+        out = {}
+        for name in ("main", "worker", "verifier"):
+            node = self.cfg.node(name)
+            out[name] = {
+                "source": node.source,
+                "model": node.model,
+                "label": registry.label(self.cfg, node.source, node.model),
+            }
+        return out
 
     def _resolve_workdir(self, workdir: str | None) -> Path:
         """把页面传来的产出目录变成绝对路径；不存在就建，建不了就说清楚原因。"""

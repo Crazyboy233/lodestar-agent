@@ -95,14 +95,18 @@ export interface SaveConfigResponse {
   note?: string;
 }
 
+export type NodeIdKey = 'main' | 'worker' | 'verifier';
+
 /** 一次 run 的前端入参：字段缺省 = 用后端的默认语义（别拿空串代替「不传」） */
 export interface RunStart {
   goal: string;
   thread?: string;
   resume?: boolean;
-  /** 缺省=沿用配置；''=显式用 CLI 默认模型 */
-  workerModel?: string;
-  verifierModel?: string;
+  /**
+   * 这次运行要给哪些节点换来源 / 模型。
+   * 整个节点缺省 = 沿用配置；只给 model 且为空串 = 显式用该来源的默认模型。
+   */
+  nodes?: Partial<Record<NodeIdKey, { source?: string; model?: string }>>;
   /** 缺省 / 空串 = 用配置里的默认产出目录 */
   workdir?: string;
   /** 开跑前写好的引导，跟着 run 一起投递 */
@@ -123,8 +127,12 @@ export function runCommand(start: RunStart): Promise<CommandResponse> {
   const payload: Record<string, unknown> = { type: 'run', goal: start.goal };
   if (start.thread !== undefined) payload.thread = start.thread;
   if (start.resume !== undefined) payload.resume = start.resume;
-  if (start.workerModel !== undefined) payload.worker_model = start.workerModel;
-  if (start.verifierModel !== undefined) payload.verifier_model = start.verifierModel;
+  // 每个节点两个字段（source / model）：只传用户真的改过的那部分
+  for (const [node, pick] of Object.entries(start.nodes ?? {})) {
+    if (!pick) continue;
+    if (pick.source !== undefined) payload[`${node}_source`] = pick.source;
+    if (pick.model !== undefined) payload[`${node}_model`] = pick.model;
+  }
   if (start.workdir) payload.workdir = start.workdir;
   if (start.seedNotes?.length) payload.seed_notes = start.seedNotes;
   return command(payload);

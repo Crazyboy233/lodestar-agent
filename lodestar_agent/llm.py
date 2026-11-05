@@ -1,7 +1,11 @@
-"""主 agent 的模型调用层：错误归类 + 可中断的流式调用 + 重试。
+"""纯文本角色的调用层：错误归类 + 可中断的流式调用 + 重试。
 
-单独成文件的原因：这层要处理的是"连接"（能不能真的停下生成），
-和节点里"该怎么规划"是两件事，混在一起会让节点逻辑更难读。
+这层要处理的是「连接」（能不能真的停下生成），和节点里「该怎么规划」是两件事，
+混在一起会让节点逻辑更难读。
+
+`LangchainChat` 是 `ChatBackend` 契约的一个实现：任何有 `.stream()` / `.invoke()`
+的 langchain 风格对象都能塞进来（真实链路是 ChatOpenAI，测试里是假对象）。
+CLI 来源不用这个适配器 —— 它有自己的一套（见 providers/cli）。
 """
 
 from __future__ import annotations
@@ -24,7 +28,7 @@ def explain(exc: Exception | None) -> str:
     if "timeout" in low or "timed out" in low or "timedout" in low:
         return "请求超时：网络慢或模型服务过载"
     if "401" in low or "auth" in low or "api key" in low or "invalid" in low:
-        return "认证失败：检查 api key 或 codebuddy 登录态"
+        return "认证失败：检查这个来源的 api_key / 登录态"
     if "connection" in low or "connect" in low or "network" in low or "refused" in low:
         return "网络连接问题：检查网络 / base_url 是否可达"
     if "500" in low or "502" in low or "503" in low or "server" in low:
@@ -64,12 +68,31 @@ def invoke_interruptible(llm, prompt: str, interrupted=None):
     return AIMessage(content="".join(parts))
 
 
-def call_llm(llm, node: str, prompt: str, max_retries: int, interrupted=None):
-    """带重试的主 agent 模型调用；重试耗尽则抛 AgentFailure。"""
+class LangchainChat:
+    """把 langchain 风格的模型对象适配成 `ChatBackend`。"""
+
+    def __init__(self, llm, label: str = ""):
+        self.llm = llm
+        self.label = label
+
+    def complete(self, prompt: str, interrupted=None) -> str:
+        msg = invoke_interruptible(self.llm, prompt, interrupted)
+        return str(getattr(msg, "content", "") or "")
+
+
+def as_chat(llm, label: str = ""):
+    """已经是 ChatBackend 就原样返回，否则套一层适配（测试注入假模型时走这条）。"""
+    if hasattr(llm, "complete"):
+        return llm
+    return LangchainChat(llm, label=label)
+
+
+def call_chat(backend, node: str, prompt: str, max_retries: int, interrupted=None) -> str:
+    """带重试的纯文本调用；重试耗尽则抛 AgentFailure。"""
     last_exc: Exception | None = None
     for attempt in range(max_retries + 1):
         try:
-            return invoke_interruptible(llm, prompt, interrupted)
+            return backend.complete(prompt, interrupted)
         except ModelAborted:
             raise  # 主动断开不重试，交给调用方收尾
         except Exception as exc:  # noqa: BLE001 - 统一转成 AgentFailure

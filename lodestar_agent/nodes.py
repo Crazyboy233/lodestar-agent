@@ -1,7 +1,10 @@
 """图的四个节点：plan（动态规划）/ worker（执行）/ verify（验收）/ synth（汇总）。
 
-从 `graph.py` 里搬出来的独立类，依赖显式传进来（cfg / control / llm），不再靠
+从 `graph.py` 里搬出来的独立类，依赖显式传进来（cfg / control / chat），不再靠
 闭包捕获。这样节点可以单独构造和测试，`graph.py` 只剩「把节点连成图」。
+
+节点不关心模型从哪来：主 agent 只说「我要一段文本」，worker / 验收只说「我要一个
+会在目录里动手的 agent」；换成 API、codebuddy 还是别的 CLI，都在 `providers/` 里。
 """
 
 from __future__ import annotations
@@ -9,28 +12,27 @@ from __future__ import annotations
 import json
 import time
 
-from langchain_core.messages import AIMessage
-
 from . import prompts
 from .config import Config
 from .control import Control
 from .errors import AgentFailure, ModelAborted
-from .llm import call_llm
+from .llm import call_chat
 from .parsing import extract_array, extract_object, normalize_items
+from .providers import registry
 from .records import dedupe, drained, settled
-from .worker import CliOptions, run_verifier, run_worker
+from .worker import run_verifier, run_worker
 
 _PLAN_LABEL = "plan(拆解任务方案)"
 _DECISION_LABEL = "plan(动态决策)"
 
 
 class Nodes:
-    """把一个 Config + 一个模型 + 一个控制面绑成四个节点函数。"""
+    """把一个 Config + 一个纯文本模型 + 一个控制面绑成四个节点函数。"""
 
-    def __init__(self, cfg: Config, control: Control, llm=None):
+    def __init__(self, cfg: Config, control: Control, chat=None):
         self.cfg = cfg
         self.control = control
-        self.llm = llm
+        self.chat = chat
 
     # ── 主 agent 的模型调用 ────────────────────────────────
     def _interrupt(self) -> bool:
@@ -46,25 +48,25 @@ class Nodes:
         """
         self.control.emit(f"prompt → {label}\n{prompt}", kind=kind, role="prompt")
 
-    def _ask(self, node: str, label: str, prompt: str):
+    def _ask(self, node: str, label: str, prompt: str) -> str:
         """主 agent 的模型调用统一走这里：前后打点 + 可中断，页面才知道谁在干活。"""
-        self.control.set_busy(node, model=self.cfg.main_agent.model)
+        self.control.set_busy(node, model=self._main_label())
         self._emit_prompt(node, label, prompt)
         try:
-            return call_llm(
-                self.llm, label, prompt, self.cfg.main_agent.max_retries, self._interrupt,
+            return call_chat(
+                self.chat, label, prompt, self.cfg.main.max_retries, self._interrupt,
             )
         except ModelAborted:
             # 连接已断，别等结果：节点里的 stop 检查会把流程导向收尾
             self.control.emit(f"已断开 {label} 的模型连接（超过等待上限）", kind="stop")
-            return AIMessage(content="")
+            return ""
         finally:
             self.control.set_busy(None)
 
     def _split_plan(self, goal: str) -> tuple[list[dict], str]:
         """拆「任务方案」。JSON 解析失败时带上纠正提示重试，避免一次跑偏就降级。
 
-        注意这里是「解析重试」，和 call_llm 里的「请求重试」是两层：
+        注意这里是「解析重试」，和 call_chat 里的「请求重试」是两层：
         请求能正常返回、但内容不是合法 JSON 数组，算解析失败。
         """
         guidance = prompts.format_guidance(self.control.take_notes("main"), "拆解任务方案")
@@ -72,16 +74,15 @@ class Nodes:
             goal=goal, workdir=self.cfg.worker.workdir, guidance=guidance,
         )
         raw = ""
-        for attempt in range(self.cfg.main_agent.plan_retries + 1):
+        for attempt in range(self.cfg.main.plan_retries + 1):
             if self.control.stop_requested:
                 # 已经要收工了，别再为了拆解去开新的模型调用
                 return [], raw
-            msg = self._ask("plan", _PLAN_LABEL, prompt)
-            raw = (getattr(msg, "content", "") or "").strip()
+            raw = self._ask("plan", _PLAN_LABEL, prompt).strip()
             plan = normalize_items(extract_array(raw) or [])
             if plan:
                 return plan, raw
-            if attempt < self.cfg.main_agent.plan_retries:
+            if attempt < self.cfg.main.plan_retries:
                 snippet = raw[:300] or "(空输出)"
                 prompt = prompts.PLAN_INIT_PROMPT.format(
                     goal=goal, workdir=self.cfg.worker.workdir, guidance=guidance,
@@ -96,7 +97,7 @@ class Nodes:
 
         以前这两段是各写一遍的（同一份 format 参数表出现两次），改提示词要改两处。
         """
-        if self.llm is None:
+        if self.chat is None:
             return None, ""
         current = state.get("current") or {}
         guidance = prompts.format_guidance(self.control.take_notes("main"), "决策")
@@ -113,7 +114,7 @@ class Nodes:
             guidance=guidance,
         )
         msg = self._ask("plan", _DECISION_LABEL, prompt)
-        raw = getattr(msg, "content", "") or ""
+        raw = msg or ""
         return extract_object(raw), raw
 
     # ── 分支结果 ──────────────────────────────────────────
@@ -177,7 +178,7 @@ class Nodes:
             plan_raw = ""
             note = ""
             if not plan:
-                if self.llm is None:
+                if self.chat is None:
                     plan = [{"task": state.get("goal", ""), "verify": ""}]
                 else:
                     plan, plan_raw = self._split_plan(state.get("goal", ""))
@@ -185,7 +186,7 @@ class Nodes:
                         # 解析重试用尽仍拆不出来：退化为单任务，并把降级原因带到日志里
                         plan = [{"task": state.get("goal", ""), "verify": ""}]
                         note = (
-                            f"拆解重试 {self.cfg.main_agent.plan_retries} 次后仍无法解析成 JSON，"
+                            f"拆解重试 {self.cfg.main.plan_retries} 次后仍无法解析成 JSON，"
                             "已降级为单任务（goal 本身）"
                         )
             if self.control.stop_requested:
@@ -276,7 +277,7 @@ class Nodes:
 
         control.set_busy(
             "worker",
-            model=self._model_label(self.cfg.worker.cli, self.cfg.worker.model),
+            model=self._worker_label(),
             task=item["task"],
             attempt=state.get("attempts", 0) + 1,
             max_attempts=self.cfg.verifier.max_rounds,
@@ -284,7 +285,8 @@ class Nodes:
         try:
             result = run_worker(
                 item["task"],
-                self._worker_options(),
+                self._worker_agent(),
+                cwd=self.cfg.worker.workdir,
                 feedback=state.get("feedback", ""),
                 guidance=guidance,
                 resume_session=resume_session,
@@ -328,7 +330,7 @@ class Nodes:
             return {"draining": True, "verdict_ready": False,
                     "aborted_stage": "verify", "aborted_task": item}
 
-        if self.llm is None:  # dry-run：跳过验收，但执行失败照样算失败
+        if self.chat is None:  # dry-run：跳过验收，但执行失败照样算失败
             passed = not state.get("last_error")
             reason = "dry-run：跳过验收" if passed else f"worker 执行失败：{state['last_error']}"
             fix = ""
@@ -338,7 +340,7 @@ class Nodes:
         else:
             control.set_busy(
                 "verifier",
-                model=self._model_label(self.cfg.verifier.cli, self.cfg.verifier.model),
+                model=self._verifier_label(),
                 task=item["task"],
                 attempt=state.get("attempts", 0),
                 max_attempts=self.cfg.verifier.max_rounds,
@@ -348,7 +350,8 @@ class Nodes:
                     item["task"],
                     item.get("verify", ""),
                     state.get("last_output", ""),
-                    self._verifier_options(),
+                    self._verifier_agent(),
+                    cwd=self.cfg.worker.workdir,
                     scratch=self.cfg.worker.workdir / self.cfg.verifier.scratch_dir,
                     max_retries=self.cfg.verifier.max_retries,
                     on_prompt=lambda text: self._emit_prompt("verifier", "verifier(验收)", text),
@@ -393,21 +396,21 @@ class Nodes:
         if state.get("abort") or state.get("draining"):
             return {"answer": self._drain_report(state)}
 
-        if self.llm is None:
+        if self.chat is None:
             lines = [
                 f"[{'PASS' if r['passed'] else 'FAIL'}] {r['task']}（{r['attempts']} 轮）\n{r['reason']}"
                 for r in dedupe(records)
             ]
             return {"answer": "\n\n".join(lines)}
 
-        msg = self._ask(
+        answer = self._ask(
             "synth", "synthesize(汇总)",
             prompts.SYNTH_PROMPT.format(
                 goal=state.get("goal", ""),
                 records=prompts.format_records_block(records),
             ),
         )
-        return {"answer": (getattr(msg, "content", "") or "").strip()}
+        return {"answer": answer.strip()}
 
     def _drain_report(self, state: dict) -> str:
         remaining = state.get("plan") or []
@@ -437,10 +440,15 @@ class Nodes:
         lines.append("产物留在 workdir；checkpoint 已保存，可用 --resume 接着做。")
         return "\n".join(lines)
 
-    # ── CLI 参数 ─────────────────────────────────────────
-    @staticmethod
-    def _model_label(cli: str, model: str) -> str:
-        return f"{cli.rsplit('/', 1)[-1]} · {model or '默认模型'}"
+    # ── 来源与模型 ───────────────────────────────────────
+    def _main_label(self) -> str:
+        return registry.label(self.cfg, self.cfg.main.source, self.cfg.main.model)
+
+    def _worker_label(self) -> str:
+        return registry.label(self.cfg, self.cfg.worker.source, self.cfg.worker.model)
+
+    def _verifier_label(self) -> str:
+        return registry.label(self.cfg, self.cfg.verifier.source, self.cfg.verifier.model)
 
     def _cancel(self):
         return self.control.stop_event
@@ -448,20 +456,23 @@ class Nodes:
     def _deadline(self):
         return self.control.drain_deadline
 
-    def _worker_options(self) -> CliOptions:
+    def _worker_agent(self):
+        """按配置现造一个执行 agent：来源可以是 API，也可以是任意 CLI。"""
         w = self.cfg.worker
-        return CliOptions(
-            cwd=w.workdir, cli=w.cli, model=w.model, allowed_tools=w.allowed_tools,
-            add_dirs=list(w.add_dirs), timeout=w.timeout_seconds, max_turns=w.max_turns,
-            extra_env=dict(w.env), cancel=self._cancel(), drain_deadline=self._deadline,
+        return registry.build_agent(
+            self.cfg,
+            source=w.source, model=w.model, allowed_tools=w.allowed_tools,
+            timeout=w.timeout_seconds, max_turns=w.max_turns, extra_env=dict(w.env),
+            cancel=self._cancel(), drain_deadline=self._deadline,
         )
 
-    def _verifier_options(self) -> CliOptions:
+    def _verifier_agent(self):
         v = self.cfg.verifier
-        return CliOptions(
-            cwd=self.cfg.worker.workdir, cli=v.cli, model=v.model,
-            allowed_tools=v.allowed_tools, timeout=v.timeout_seconds,
-            extra_env=dict(v.env), cancel=self._cancel(), drain_deadline=self._deadline,
+        return registry.build_agent(
+            self.cfg,
+            source=v.source, model=v.model, allowed_tools=v.allowed_tools,
+            timeout=v.timeout_seconds, max_turns=0, extra_env=dict(v.env),
+            cancel=self._cancel(), drain_deadline=self._deadline,
         )
 
     # ── 路由 ─────────────────────────────────────────────

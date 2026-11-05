@@ -26,7 +26,7 @@ import uvicorn
 from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from .config import as_editable, collect_overrides, save_overrides
+from .config import ApiProviderConfig, as_editable, collect_overrides, save_overrides
 from .control import Control
 from .fspick import PickUnavailable, pick_directory
 from .history import HistoryStore, parse_log
@@ -69,7 +69,11 @@ def _parse_start(payload: dict) -> StartRequest:
         goal=str(payload.get("goal") or ""),
         thread=opt_str("thread"),
         resume=bool(payload.get("resume")),
+        main_source=opt_str("main_source"),
+        main_model=opt_str("main_model"),
+        worker_source=opt_str("worker_source"),
         worker_model=opt_str("worker_model"),
+        verifier_source=opt_str("verifier_source"),
         verifier_model=opt_str("verifier_model"),
         workdir=opt_str("workdir"),
         seed_notes=tuple(seeds),
@@ -247,7 +251,13 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
             body = payload.get("payload")
             if not isinstance(body, dict):
                 raise HTTPException(400, "payload 必须是对象")
-            patch, errors = collect_overrides(body, runner.cfg.main_agent.api_key)
+            providers = runner.cfg.providers
+            api_keys = {
+                name: spec.api_key for name, spec in providers.items()
+                if isinstance(spec, ApiProviderConfig)
+            }
+            kinds = {name: spec.kind for name, spec in providers.items()}
+            patch, errors = collect_overrides(body, api_keys, kinds)
             if errors:
                 return JSONResponse({"ok": False, "errors": errors}, status_code=400)
             if not patch:

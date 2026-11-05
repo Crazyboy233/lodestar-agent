@@ -5,8 +5,8 @@
                   └─ done ──────► synthesize ←─────┘
                                           （plan 循环回来读产出+验收，修订方案再发布）
 
-节点逻辑在 `nodes.py`，prompt 在 `prompts.py`，记录结构在 `records.py`。
-这里只做三件事：声明 State、建模型、把节点连起来。
+节点逻辑在 `nodes.py`，prompt 在 `prompts.py`，记录结构在 `records.py`，
+模型来源在 `providers/`。这里只做三件事：声明 State、取模型通道、把节点连起来。
 """
 
 from __future__ import annotations
@@ -14,13 +14,14 @@ from __future__ import annotations
 import operator
 from typing import Annotated, TypedDict
 
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
 from .config import Config
 from .control import Control
 from .errors import AgentFailure, ModelAborted
+from .llm import as_chat
 from .nodes import Nodes
+from .providers import registry
 
 __all__ = ["AgentFailure", "ModelAborted", "State", "build_graph"]
 
@@ -57,17 +58,22 @@ class State(TypedDict, total=False):
 
 def build_graph(cfg: Config, use_llm: bool = True, llm=None, checkpointer=None,
                 control: Control | None = None):
-    """`control` 缺省时新建一个「没人订阅」的控制面 —— 节点里不必再到处判空。"""
+    """`control` 缺省时新建一个「没人订阅」的控制面 —— 节点里不必再到处判空。
+
+    `llm` 是测试用的注入点：任何 langchain 风格的对象都行。不注入时按
+    `nodes.main.source` 到来源注册表里取 —— 主 agent 用 API 还是某个 CLI，由配置决定。
+    """
     control = control if control is not None else Control()
-    if llm is None and use_llm:
-        llm = ChatOpenAI(
-            model=cfg.main_agent.model,
-            api_key=cfg.main_agent.api_key,
-            base_url=cfg.main_agent.base_url,
-            temperature=cfg.main_agent.temperature,
+    chat = None
+    if llm is not None:
+        chat = as_chat(llm, label=registry.label(cfg, cfg.main.source, cfg.main.model))
+    elif use_llm:
+        chat = registry.build_chat(
+            cfg, source=cfg.main.source, model=cfg.main.model,
+            temperature=cfg.main.temperature,
         )
 
-    nodes = Nodes(cfg, control, llm)
+    nodes = Nodes(cfg, control, chat)
 
     graph = StateGraph(State)
     graph.add_node("plan", nodes.plan)

@@ -14,22 +14,30 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from lodestar_agent.config import load_config  # noqa: E402
+from lodestar_agent.config import CliProviderConfig, load_config  # noqa: E402
 from lodestar_agent.control import Control  # noqa: E402
 from lodestar_agent.errors import AgentFailure, ModelAborted  # noqa: E402
 from lodestar_agent.graph import build_graph  # noqa: E402
 from lodestar_agent.llm import invoke_interruptible  # noqa: E402
 from lodestar_agent.parsing import extract_array, normalize_items  # noqa: E402
+from lodestar_agent.providers.base import ProviderError, RunResult  # noqa: E402
+from lodestar_agent.providers.cli import CliProvider  # noqa: E402
+from lodestar_agent.providers.cli.dialect import _parse_json  # noqa: E402
+from lodestar_agent.providers.cli.dialect import diagnose as _diagnose  # noqa: E402
+from lodestar_agent.providers.registry import check as lodestar_check  # noqa: E402
 from lodestar_agent.records import tasks_from_state  # noqa: E402
 from lodestar_agent.session import Runner, StartRequest  # noqa: E402
-from lodestar_agent.worker import (  # noqa: E402
-    CliOptions,
-    CliResult,
-    Verdict,
-    _diagnose,
-    _parse_json,
-    run_worker,
-)
+from lodestar_agent.worker import Verdict, run_worker  # noqa: E402
+
+
+def cli_agent(command, *, timeout: float = 30.0, model: str = "",
+              tools: str = "Read,Write,Edit,Bash", cancel=None, deadline=None):
+    """把一个可执行文件包成 agent：测试里只关心「按 CLI 协议跑一次」。"""
+    provider = CliProvider("test", CliProviderConfig(command=str(command)))
+    return provider.agent(
+        model=model, allowed_tools=tools, timeout=timeout, max_turns=0,
+        extra_env={}, cancel=cancel, drain_deadline=deadline,
+    )
 
 
 class FakeLLM:
@@ -52,7 +60,7 @@ class FakeLLM:
 def _fake_worker(calls: list[str], ok: bool = True):
     def inner(task, *_a, **kwargs):
         calls.append(task)
-        return CliResult(ok=ok, output=f"done: {task}", duration=0.0, error="" if ok else "boom")
+        return RunResult(ok=ok, output=f"done: {task}", duration=0.0, error="" if ok else "boom")
 
     return inner
 
@@ -133,7 +141,7 @@ def test_exec_failure_terminates_after_retries() -> None:
 
     def failing_worker(task, *_a, **kwargs):
         calls.append(task)
-        return CliResult(ok=False, output="", duration=0.0, error="429 too many requests")
+        return RunResult(ok=False, output="", duration=0.0, error="429 too many requests")
 
     plan = [{"task": "t1", "verify": ""}]
     with patch("lodestar_agent.nodes.run_worker", side_effect=failing_worker):
@@ -184,7 +192,7 @@ def test_plan_dynamic_replan() -> None:
 def test_plan_parse_retry() -> None:
     """拆解输出不是合法 JSON 时，带纠正提示重试，而不是一次跑偏就降级。"""
     cfg = load_config("config.yaml")
-    cfg.main_agent.plan_retries = 2
+    cfg.main.plan_retries = 2
     cfg.verifier.max_rounds = 3
 
     llm = FakeLLM([
@@ -216,7 +224,7 @@ def test_plan_parse_retry() -> None:
 def test_plan_parse_retry_exhausted_falls_back() -> None:
     """重试用尽仍解析不出来时，退化为单任务（goal 本身），不影响后续流程。"""
     cfg = load_config("config.yaml")
-    cfg.main_agent.plan_retries = 2
+    cfg.main.plan_retries = 2
     cfg.verifier.max_rounds = 3
 
     llm = FakeLLM([
@@ -241,7 +249,7 @@ def test_plan_parse_retry_exhausted_falls_back() -> None:
         )
 
     assert worker_calls == ["把 a 改成 b"], worker_calls
-    assert llm.calls == 1 + cfg.main_agent.plan_retries + 2, llm.calls
+    assert llm.calls == 1 + cfg.main.plan_retries + 2, llm.calls
     assert out["records"][0]["task"] == "把 a 改成 b"
     print("ok  plan_parse_retry_exhausted_falls_back", llm.calls)
 
@@ -291,7 +299,7 @@ def test_checkpoint_persists_and_resumes() -> None:
 
         def ok_worker(task, *_a, **_kw):
             resumed.append(task)
-            return CliResult(ok=True, output=f"done: {task}", duration=0.0)
+            return RunResult(ok=True, output=f"done: {task}", duration=0.0)
 
         app2 = build_graph(
             cfg,
@@ -328,7 +336,7 @@ def test_resume_after_exec_failure_resets_attempts() -> None:
         app = build_graph(cfg, use_llm=False, checkpointer=saver)
 
         def failing(_task, *_a, **_kw):
-            return CliResult(ok=False, output="", duration=0.0, error="401 unauthorized")
+            return RunResult(ok=False, output="", duration=0.0, error="401 unauthorized")
 
         with patch("lodestar_agent.nodes.run_worker", side_effect=failing):
             try:
@@ -397,7 +405,7 @@ def test_guidance_reaches_worker_once() -> None:
         if task == "t1":
             # 第一条正在跑时投第二条：不打断它，等下一次调用再注入
             control.push_note("worker", "第二条：记得写中文注释")
-        return CliResult(ok=True, output=f"done: {task}", duration=0.0)
+        return RunResult(ok=True, output=f"done: {task}", duration=0.0)
 
     def always_pass(_t, _v, _o, *_a, **_kw):
         return Verdict(True, "通过", "", duration=0.0)
@@ -433,7 +441,7 @@ def test_boundary_stop_waits_for_current_node() -> None:
         calls.append(task)
         # 跑到一半时用户点退出 —— 关键：这次调用仍然正常返回，不被打断
         control.request_stop("测试退出")
-        return CliResult(ok=True, output=f"done: {task}", duration=3.0)
+        return RunResult(ok=True, output=f"done: {task}", duration=3.0)
 
     def fake_verifier(task, *_a, **_kw):
         verdicts.append(task)
@@ -470,7 +478,7 @@ def test_forced_kill_marks_task_for_retry() -> None:
 
     def forcing_worker(task, *_a, **_kwargs):
         control.request_stop("测试超时")
-        return CliResult(ok=False, output="", duration=60.0,
+        return RunResult(ok=False, output="", duration=60.0,
                          error="超过等待上限仍未结束，已强制终止", aborted=True)
 
     plan = [{"task": "t1", "verify": "ls a"}, {"task": "t2", "verify": "ls b"}]
@@ -512,8 +520,9 @@ def test_cancel_event_does_not_kill_running_cli() -> None:
 
         started = time.time()
         ok_result = run_worker(
-            "do", CliOptions(cwd=Path(tmp) / "wd", cli=str(fake), timeout=30,
-                             cancel=cancel, drain_deadline=time.time() + 30),
+            "do",
+            cli_agent(fake, cancel=cancel, deadline=time.time() + 30),
+            cwd=Path(tmp) / "wd",
         )
         elapsed = time.time() - started
         assert ok_result.ok, ok_result.error
@@ -522,8 +531,9 @@ def test_cancel_event_does_not_kill_running_cli() -> None:
 
         # 等待上限已经过了 → 才强杀
         killed = run_worker(
-            "do", CliOptions(cwd=Path(tmp) / "wd2", cli=str(fake), timeout=30,
-                             cancel=cancel, drain_deadline=time.time() + 0.05),
+            "do",
+            cli_agent(fake, cancel=cancel, deadline=time.time() + 0.05),
+            cwd=Path(tmp) / "wd2",
         )
         assert killed.aborted is True, killed
         assert not killed.ok
@@ -595,8 +605,9 @@ def test_drain_deadline_is_read_lazily() -> None:
         try:
             started = time.time()
             result = run_worker(
-                "do", CliOptions(cwd=Path(tmp) / "wd", cli=str(fake), timeout=30,
-                                 cancel=cancel, drain_deadline=lambda: box["deadline"]),
+                "do",
+                cli_agent(fake, cancel=cancel, deadline=lambda: box["deadline"]),
+                cwd=Path(tmp) / "wd",
             )
             elapsed = time.time() - started
         finally:
@@ -647,9 +658,13 @@ def test_runner_lifecycle() -> None:
     print("ok  runner_lifecycle")
 
 
-def test_runner_model_override() -> None:
-    """页面选模型：传值就覆盖配置，传空串 = 显式用 CLI 默认，传 None = 沿用配置。"""
+def test_runner_node_override() -> None:
+    """页面选来源与模型：传值就覆盖配置，传空串 = 用该来源默认，传 None = 沿用配置。
+
+    三个节点彼此独立 —— 这里把主 agent 换成 CLI、worker 换成 API，验证混搭真的生效。
+    """
     cfg = load_config("config.yaml")
+    cfg.main.model = "deepseek-chat"
     cfg.worker.model = "glm-5.3"
     cfg.verifier.model = "kimi-k3.1-pro"
     control = Control()
@@ -657,24 +672,43 @@ def test_runner_model_override() -> None:
     seen: dict = {}
 
     def fake_session(cfg_arg, goal, thread, *, control, con, resume, dry_run):
-        seen["worker"] = cfg_arg.worker.model
-        seen["verifier"] = cfg_arg.verifier.model
+        seen["main"] = (cfg_arg.main.source, cfg_arg.main.model)
+        seen["worker"] = (cfg_arg.worker.source, cfg_arg.worker.model)
+        seen["verifier"] = (cfg_arg.verifier.source, cfg_arg.verifier.model)
         return 0
 
     with patch("lodestar_agent.session.run_session", side_effect=fake_session):
-        runner.start(StartRequest(goal="t1", worker_model="deepseek-v4.1-flash", verifier_model=""))
+        runner.start(StartRequest(
+            goal="t1",
+            main_source="codebuddy", main_model="glm-5.3",
+            worker_source="api", worker_model="", verifier_model="",
+        ))
         runner.join(5)
-        assert seen == {"worker": "deepseek-v4.1-flash", "verifier": ""}, seen
+        assert seen == {
+            "main": ("codebuddy", "glm-5.3"),
+            "worker": ("api", ""),
+            "verifier": ("codebuddy", ""),
+        }, seen
+        assert runner.session["nodes"]["main"] == {
+            "source": "codebuddy", "model": "glm-5.3", "label": "codebuddy · glm-5.3",
+        }, runner.session["nodes"]
 
-        runner.start(StartRequest(goal="t2", worker_model=None, verifier_model=None))
-        runner.join(5)
         # None = 不覆盖，沿用上次设置后的值
-        assert seen == {"worker": "deepseek-v4.1-flash", "verifier": ""}, seen
-
-        runner.start(StartRequest(goal="t3", worker_model="deepseek-v4-pro", verifier_model="glm-5.2"))
+        runner.start(StartRequest(goal="t2"))
         runner.join(5)
-        assert seen == {"worker": "deepseek-v4-pro", "verifier": "glm-5.2"}, seen
-    print("ok  runner_model_override")
+        assert seen == {
+            "main": ("codebuddy", "glm-5.3"),
+            "worker": ("api", ""),
+            "verifier": ("codebuddy", ""),
+        }, seen
+
+        # 来源写错 → 400 级的 ValueError，而不是跑起来才发现
+        try:
+            runner.start(StartRequest(goal="t3", worker_source="nope"))
+            raise AssertionError("不存在的来源应该被拒绝")
+        except ValueError as exc:
+            assert "nope" in str(exc), exc
+    print("ok  runner_node_override")
 
 
 def test_build_tasks_states() -> None:
@@ -743,57 +777,94 @@ def test_config_overrides() -> None:
         as_editable, collect_overrides, mask_key, save_overrides,
     )
 
+    kinds = {"api": "api", "codebuddy": "cli"}
     real_key = "sk-abcdefgh12345678"
     masked = mask_key(real_key)
     assert masked != real_key and masked.startswith("sk-a"), masked
 
     # 掩码 / 空值不回写
     patch, errors = collect_overrides(
-        {"main_agent": {"api_key": masked, "model": "m1"}}, real_key
+        {"providers": {"api": {"api_key": masked, "base_url": "https://y"}}},
+        {"api": real_key}, kinds,
     )
-    assert errors == [] and patch == {"main_agent": {"model": "m1"}}, patch
-    patch, _ = collect_overrides({"main_agent": {"api_key": ""}}, real_key)
+    assert errors == [] and patch == {"providers": {"api": {"base_url": "https://y"}}}, patch
+    patch, _ = collect_overrides({"providers": {"api": {"api_key": ""}}}, {"api": real_key}, kinds)
     assert patch == {}, "空 key 不该覆盖已有值"
 
     # 填了新 key 才写
-    patch, _ = collect_overrides({"main_agent": {"api_key": "sk-new"}}, real_key)
-    assert patch["main_agent"]["api_key"] == "sk-new"
+    patch, _ = collect_overrides(
+        {"providers": {"api": {"api_key": "sk-new"}}}, {"api": real_key}, kinds,
+    )
+    assert patch["providers"]["api"]["api_key"] == "sk-new"
 
-    # 白名单：未知字段忽略
-    patch, _ = collect_overrides({"main_agent": {"evil": "x"}, "nope": {"a": 1}})
-    assert patch == {}, patch
+    # 白名单：未知字段、未知来源都忽略/报错，不会凭空造出一个来源
+    patch, errors = collect_overrides(
+        {"providers": {"api": {"evil": "x"}, "nope": {"command": "x"}}, "nope": {"a": 1}},
+        {"api": real_key}, kinds,
+    )
+    assert patch == {} and errors and "nope" in errors[0], (patch, errors)
 
     # 范围校验
-    _, errors = collect_overrides({"main_agent": {"temperature": 9}})
+    _, errors = collect_overrides({"nodes": {"main": {"temperature": 9}}})
     assert errors and "temperature" in errors[0], errors
 
     # lines / kv
     patch, _ = collect_overrides({
-        "worker": {"add_dirs": "a\nb", "env": "A=1\nB=2", "max_turns": "7"},
+        "nodes": {"worker": {"add_dirs": "a\nb", "env": "A=1\nB=2", "max_turns": "7"}},
     })
-    assert patch["worker"]["add_dirs"] == ["a", "b"]
-    assert patch["worker"]["env"] == {"A": "1", "B": "2"}
-    assert patch["worker"]["max_turns"] == 7
+    assert patch["nodes"]["worker"]["add_dirs"] == ["a", "b"]
+    assert patch["nodes"]["worker"]["env"] == {"A": "1", "B": "2"}
+    assert patch["nodes"]["worker"]["max_turns"] == 7
 
-    # 模型候选：空串是「默认（CLI 决定）」，不写进配置（否则保存一次就被过滤掉）
+    # 三个节点都能单独改 source —— 这就是「任意节点任意来源」的落点
+    patch, _ = collect_overrides({
+        "nodes": {
+            "main": {"source": "codebuddy"},
+            "worker": {"source": "api"},
+            "verifier": {"source": "codebuddy", "model": "glm-5.3"},
+        },
+    })
+    assert patch["nodes"]["main"]["source"] == "codebuddy"
+    assert patch["nodes"]["worker"]["source"] == "api"
+    assert patch["nodes"]["verifier"]["model"] == "glm-5.3"
+
+    # 模型候选按来源分组：空串是「默认模型」，不写进配置（否则保存一次就被过滤掉）
     view = as_editable(load_config("config.yaml"))
-    assert view["ui"]["models"] and not view["ui"]["models"].startswith("\n"), view["ui"]
+    assert view["ui"]["models"]["codebuddy"], view["ui"]
     patch, _ = collect_overrides({"ui": {"models": view["ui"]["models"]}})
-    assert "" not in patch["ui"]["models"] and patch["ui"]["models"], patch["ui"]
+    assert "" not in patch["ui"]["models"]["codebuddy"], patch["ui"]
+
+    # 旧格式（main_agent / worker / verifier）在读取时自动迁移成 providers + nodes
+    with tempfile.TemporaryDirectory() as tmp:
+        legacy = Path(tmp) / "legacy.yaml"
+        legacy.write_text(
+            "main_agent:\n  base_url: 'https://x'\n  api_key: 'k'\n  model: 'base'\n"
+            "worker:\n  cli: codebuddy\n  model: 'w1'\n  workdir: './ws'\n"
+            "verifier:\n  cli: codebuddy\n  model: 'v1'\n"
+            "ui:\n  models: ['', 'm1']\n",
+            encoding="utf-8",
+        )
+        old = load_config(legacy)
+        assert set(old.providers) == {"api", "codebuddy"}, old.providers
+        assert old.main.source == "api" and old.main.model == "base"
+        assert old.worker.source == "codebuddy" and old.worker.model == "w1"
+        assert old.verifier.model == "v1"
+        assert old.providers["api"].api_key == "k"
+        assert old.ui.models["codebuddy"] == ["", "m1"], old.ui.models
 
     # 写回 config.local.yaml，并且多次保存不会互相覆盖
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         cfg_file = root / "config.yaml"
         cfg_file.write_text(
-            "main_agent:\n  base_url: 'https://x'\n  model: 'base'\n"
-            "worker:\n  model: ''\nverifier:\n  model: ''\n",
+            "providers:\n  api:\n    kind: api\n    base_url: 'https://x'\n"
+            "nodes:\n  main:\n    source: api\n    model: 'base'\n",
             encoding="utf-8",
         )
-        save_overrides(root, {"worker": {"model": "glm-5.3"}})
+        save_overrides(root, {"nodes": {"worker": {"model": "glm-5.3"}}})
         assert load_config(cfg_file).worker.model == "glm-5.3"
 
-        save_overrides(root, {"verifier": {"model": "kimi-k3.1-pro"}})
+        save_overrides(root, {"nodes": {"verifier": {"model": "kimi-k3.1-pro"}}})
         cfg = load_config(cfg_file)
         assert cfg.worker.model == "glm-5.3", "第二次保存不该冲掉第一次的字段"
         assert cfg.verifier.model == "kimi-k3.1-pro"
@@ -805,7 +876,7 @@ def test_windows_tree_kill() -> None:
     """Windows 没有 killpg：停止任务时应该走 taskkill /T /F，把 CLI 的 node 子进程一起收掉。"""
     from types import SimpleNamespace
 
-    from lodestar_agent import worker
+    from lodestar_agent.providers import subproc
 
     seen: dict = {}
 
@@ -826,10 +897,10 @@ def test_windows_tree_kill() -> None:
         seen["kwargs"] = kwargs
         return SimpleNamespace(returncode=0)
 
-    with patch("lodestar_agent.worker.os.name", "nt"), patch(
-        "lodestar_agent.worker.subprocess.run", side_effect=fake_run
+    with patch("lodestar_agent.providers.subproc.os.name", "nt"), patch(
+        "lodestar_agent.providers.subproc.subprocess.run", side_effect=fake_run
     ):
-        worker._terminate_tree(FakeProc())
+        subproc.terminate_tree(FakeProc())
 
     cmd = seen["cmd"]
     assert cmd[:4] == ["taskkill", "/PID", "4321", "/T"], cmd
@@ -842,10 +913,10 @@ def test_windows_tree_kill() -> None:
         "USERPROFILE": "C:\\Users\\x", "CODEBUDDY_SERVER_PORT": "7777",
         "UNRELATED_HOST_VAR": "drop-me",
     }
-    with patch("lodestar_agent.worker.os.name", "nt"), patch.dict(
-        "lodestar_agent.worker.os.environ", fake_env, clear=True
+    with patch("lodestar_agent.providers.subproc.os.name", "nt"), patch.dict(
+        "lodestar_agent.providers.subproc.os.environ", fake_env, clear=True
     ):
-        env = worker._child_env({"EXTRA": "1"})
+        env = subproc.child_env({"EXTRA": "1"})
     assert env["SYSTEMROOT"] == "C:\\Windows", env
     assert env["PATH"] == "C:\\Windows\\System32", env
     assert "CODEBUDDY_SERVER_PORT" not in env, "宿主注入的变量不能带进去"
@@ -853,15 +924,15 @@ def test_windows_tree_kill() -> None:
     assert env["CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS"] == "1", env
 
     # npm 全局命令在 Windows 上是 .cmd shim，要走 cmd.exe /c；.exe 直接执行
-    with patch("lodestar_agent.worker.os.name", "nt"), patch.dict(
-        "lodestar_agent.worker.os.environ", {"COMSPEC": "C:\\Windows\\System32\\cmd.exe"},
+    with patch("lodestar_agent.providers.subproc.os.name", "nt"), patch.dict(
+        "lodestar_agent.providers.subproc.os.environ", {"COMSPEC": "C:\\Windows\\System32\\cmd.exe"},
         clear=True,
     ):
-        argv = worker._cli_argv("C:\\npm\\codebuddy.cmd", ["-p", "hi"])
+        argv = subproc.command_argv("C:\\npm\\codebuddy.cmd", ["-p", "hi"])
     assert argv[:4] == [
         "C:\\Windows\\System32\\cmd.exe", "/c", "C:\\npm\\codebuddy.cmd", "-p",
     ], argv
-    assert worker._cli_argv("/usr/local/bin/codebuddy", ["-p"])[0].endswith("codebuddy")
+    assert subproc.command_argv("/usr/local/bin/codebuddy", ["-p"])[0].endswith("codebuddy")
     print("ok  windows_tree_kill")
 
 
@@ -1147,12 +1218,185 @@ def test_worker_against_fake_cli() -> None:
             encoding="utf-8",
         )
         fake.chmod(0o755)
-        result = run_worker("do something", CliOptions(cwd=Path(tmp) / "wd", cli=str(fake), timeout=30))
+        result = run_worker("do something", cli_agent(fake), cwd=Path(tmp) / "wd")
 
     assert result.ok, result.error
     assert result.output == "fake worker ok", result.output
     assert result.session_id == "abc"
     print("ok  worker_against_fake_cli", result.output)
+
+
+def test_any_node_any_source() -> None:
+    """任意节点任意来源：主 agent 可以来自 CLI，worker 也可以来自 API。
+
+    这里只验证「装配出来的是对的东西」——真连模型/真起进程由各自的用例覆盖。
+    """
+    from lodestar_agent.nodes import Nodes
+    from lodestar_agent.providers.api_agent import ApiAgent
+    from lodestar_agent.providers.cli import CliAgent, CliChat
+    from lodestar_agent.providers.registry import build_agent, build_chat, provider
+
+    cfg = load_config("config.yaml")
+    cfg.main.source = "codebuddy"          # 主 agent 走 CLI（纯文本）
+    cfg.main.model = "glm-5.3"
+    cfg.worker.source = "api"              # worker 走 HTTP + 内置工具循环
+    cfg.verifier.source = "codebuddy"
+
+    assert isinstance(build_chat(cfg, source="codebuddy", model="glm-5.3"), CliChat)
+    assert isinstance(
+        build_agent(cfg, source="api", model="deepseek-chat", allowed_tools="Read,Write,Bash"),
+        ApiAgent,
+    )
+    assert isinstance(
+        build_agent(cfg, source="codebuddy", model="", allowed_tools="Read"), CliAgent,
+    )
+
+    # 节点侧只看配置，不知道也不关心来源是什么
+    nodes = Nodes(cfg, Control(), chat=FakeLLM("x"))
+    assert isinstance(nodes._worker_agent(), ApiAgent)
+    assert isinstance(nodes._verifier_agent(), CliAgent)
+    assert nodes._main_label() == "codebuddy · glm-5.3", nodes._main_label()
+
+    # 来源写错：给出「有哪些来源」而不是一句 KeyError
+    try:
+        provider(cfg, "nope")
+        raise AssertionError("不存在的来源应该报错")
+    except ProviderError as exc:
+        assert "api" in str(exc) and "codebuddy" in str(exc), exc
+
+    # 启动自检：来源没配 key / 能力不匹配都能一次报全
+    cfg.providers["api"].api_key = ""
+    problems = " ".join(lodestar_check(cfg))
+    assert "api" in problems and "key" in problems, problems
+    print("ok  any_node_any_source")
+
+
+def test_api_agent_tool_loop() -> None:
+    """API 来源当 worker：模型要工具就执行、把结果塞回去，直到它不再要。
+
+    顺手验证沙箱：路径越界必须被拒绝，而不是把文件写到工作目录外面。
+    """
+    from lodestar_agent.providers.api_agent import ApiAgent
+    from lodestar_agent.providers.local_tools import LocalTools
+
+    calls: list[dict] = []
+
+    class FakeCompletions:
+        def __init__(self, script):
+            self.script = list(script)
+
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            step = self.script.pop(0)
+            return SimpleNamespace(choices=[SimpleNamespace(message=step)])
+
+    def tool_call(name, args, call_id="c1"):
+        return SimpleNamespace(
+            content=None,
+            tool_calls=[SimpleNamespace(
+                id=call_id, function=SimpleNamespace(name=name, arguments=args),
+            )],
+        )
+
+    script = [
+        tool_call("write_file", '{"path": "a.txt", "content": "hi"}', "c1"),
+        # 越界写入：工具返回「拒绝」，循环继续
+        tool_call("write_file", '{"path": "../evil.txt", "content": "x"}', "c2"),
+        tool_call("read_file", '{"path": "a.txt"}', "c3"),
+        SimpleNamespace(content="写好了 a.txt", tool_calls=None),
+    ]
+
+    class FakeClient:
+        def __init__(self, **_kw):
+            self.chat = SimpleNamespace(completions=FakeCompletions(script))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "wd"
+        root.mkdir()
+        with patch("openai.OpenAI", FakeClient):
+            result = ApiAgent(
+                label="api · test", base_url="https://x", api_key="k", model="m",
+                allowed_tools="Read,Write,Bash",
+            ).run("写 a.txt", cwd=root)
+
+        assert result.ok, result.error
+        assert result.output == "写好了 a.txt", result.output
+        assert (root / "a.txt").read_text() == "hi"
+        assert not (Path(tmp) / "evil.txt").exists(), "越界写入必须被拒绝"
+        assert result.turns == 4, result.turns
+
+        # 工具结果真的回到了对话里：第三条 tool 消息是拒绝原因，第四条是文件内容
+        sent = [m for m in calls[-1]["messages"] if m["role"] == "tool"]
+        assert "拒绝" in sent[1]["content"], sent
+        assert "hi" in sent[2]["content"], sent
+        # 工具描述随 allowed_tools 变化：配置写的是 CLI 的叫法，这里映射成本地工具
+        assert [s["function"]["name"] for s in calls[0]["tools"]] == [
+            "read_file", "write_file", "run_command",
+        ], calls[0]["tools"]
+        # 只给 Read 时不该出现写入/命令执行
+        read_only = LocalTools(root=Path(tmp)).specs("Read")
+        assert [s["function"]["name"] for s in read_only] == ["read_file"], read_only
+    print("ok  api_agent_tool_loop")
+
+
+def test_cli_as_chat_model() -> None:
+    """把 CLI 当纯文本模型用：一次调用取回文本；到点则抛 ModelAborted（不是返回半句）。"""
+    if os.name == "nt":
+        print("skip  cli_as_chat_model（Windows 无 /bin/sh）")
+        return
+    from lodestar_agent.providers.cli import CliProvider
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = Path(tmp) / "fake-model"
+        fake.write_text(
+            "#!/bin/sh\n"
+            'echo \'{"type":"result","result":"你好","is_error":false}\'\n',
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        provider = CliProvider("test", CliProviderConfig(command=str(fake)))
+
+        chat = provider.chat(model="glm-5.3")
+        assert chat.complete("说句话") == "你好"
+        assert chat.label == "test · glm-5.3"
+
+        # interrupted 恒为真 = 已经过了等待上限 → 立刻掐断，抛 ModelAborted
+        try:
+            chat.complete("说句话", interrupted=lambda: True)
+            raise AssertionError("越过等待上限应该断开")
+        except ModelAborted:
+            pass
+    print("ok  cli_as_chat_model")
+
+
+def test_template_dialect() -> None:
+    """模板方言：不认识的新 CLI 用配置描述参数即可，不用改代码。"""
+    from lodestar_agent.providers.cli.dialect import CliCall, build_dialect
+
+    dialect = build_dialect(
+        "template",
+        args=[["exec", "{prompt}"], ["--model", "{model}"], ["--json"], ["{add_dirs}"]],
+        resume_args=[["resume", "{session}"]],
+    )
+    argv = dialect.argv(CliCall(prompt="do it", model="m1", add_dirs=()))
+    assert argv == ["exec", "do it", "--model", "m1", "--json"], argv
+
+    # 占位符为空 → 整组跳过（不会留下一个孤零零的 --model 让 CLI 报错）
+    argv = dialect.argv(CliCall(prompt="do it", model=""))
+    assert argv == ["exec", "do it", "--json"], argv
+
+    # add_dirs 是「一个占位符展开成多个参数」
+    argv = dialect.argv(CliCall(prompt="do it", add_dirs=(Path("/a"), Path("/b"))))
+    assert argv[-2:] == ["/a", "/b"], argv
+
+    # 续跑参数只在有 session 时追加
+    argv = dialect.argv(CliCall(prompt="do it", resume_session="s1"))
+    assert argv[-2:] == ["resume", "s1"], argv
+
+    # 输出解析：output=json 时取 result 字段，默认按纯文本整段拿
+    assert build_dialect("template", output="json").parse('{"result":"ok"}', "").text == "ok"
+    assert build_dialect("template").parse("plain", "").text == "plain"
+    print("ok  template_dialect")
 
 
 if __name__ == "__main__":
@@ -1174,7 +1418,7 @@ if __name__ == "__main__":
     test_model_call_is_really_cut_off()
     test_drain_deadline_is_read_lazily()
     test_runner_lifecycle()
-    test_runner_model_override()
+    test_runner_node_override()
     test_build_tasks_states()
     test_log_roundtrip_keeps_roles()
     test_config_overrides()
@@ -1183,4 +1427,8 @@ if __name__ == "__main__":
     test_history_store_and_api()
     test_web_console_guide_and_stop()
     test_worker_against_fake_cli()
+    test_any_node_any_source()
+    test_api_agent_tool_loop()
+    test_cli_as_chat_model()
+    test_template_dialect()
     print("\n全部通过")

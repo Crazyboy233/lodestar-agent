@@ -284,13 +284,83 @@
     text-overflow: ellipsis; white-space: nowrap;
   }
   .dir-browse { flex: 0 0 auto; color: var(--accent); font-family: var(--sans); font-weight: 500; }
-  .sel { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); white-space: nowrap; }
-  .sel select {
+  /* ── 自绘下拉 / 候选浮层：不用原生 select 与 datalist ── */
+  .dd { display: inline-flex; min-width: 0; vertical-align: middle; }
+  .dd-trigger {
+    display: inline-flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%;
     padding: 6px 9px; border-radius: 7px; border: 1px solid var(--border);
     background: var(--panel); color: var(--text);
-    font-family: var(--mono); font-size: 11.5px; cursor: pointer; max-width: 220px;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+    cursor: pointer; text-align: left;
   }
-  .sel select:focus { outline: none; border-color: var(--accent); }
+  .dd-trigger:hover:not(:disabled) { border-color: var(--border-strong); }
+  .dd-trigger:focus-visible {
+    outline: none; border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .dd-trigger:disabled { opacity: .6; cursor: not-allowed; }
+  .dd-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dd-value.empty { color: var(--faint); }
+  .dd-caret {
+    display: inline-flex; flex: 0 0 auto; color: var(--faint);
+    transition: transform .12s ease;
+  }
+  .dd-trigger[aria-expanded="true"] .dd-caret { transform: rotate(180deg); }
+  .dd-input {
+    width: 100%; padding: 6px 9px; border-radius: 7px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    font-family: var(--mono); font-size: 11.5px;
+  }
+  .dd-input::placeholder { color: var(--faint); }
+  .dd-input:disabled { opacity: .6; }
+  /* 浮层 fixed + portal 到 body：放在弹窗里也不会被 overflow 裁掉 */
+  .dd-panel {
+    position: fixed; z-index: 80; padding: 4px; max-height: 264px; overflow-y: auto;
+    /* 滚到底别再带着页面一起滚（会触发「页面滚动 → 收起」把面板收掉） */
+    overscroll-behavior: contain;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 9px;
+    box-shadow: 0 18px 40px -20px rgba(0,0,0,.45), 0 2px 6px -3px rgba(0,0,0,.14);
+  }
+  .dd-panel:focus { outline: none; }
+  .dd-opt {
+    display: flex; align-items: baseline; gap: 10px; width: 100%;
+    padding: 6px 8px; border: 0; border-radius: 6px;
+    background: transparent; color: var(--text); text-align: left; cursor: pointer;
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.5;
+  }
+  .dd-opt-main {
+    flex: 0 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .dd-opt-hint {
+    flex: 1 1 auto; min-width: 0; color: var(--faint); font-size: 10.5px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right;
+  }
+  .dd-opt.picked { color: var(--accent); font-weight: 600; }
+  .dd-opt.on { background: var(--accent-soft); }
+  .dd-empty { padding: 6px 8px; color: var(--faint); font-size: 11px; }
+
+  .sel { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  /* 下拉与型号输入框等高，同一行看起来才是一条线 */
+  .sel .dd-trigger { max-width: 150px; height: 28px; }
+  /* 节点选择器 = 来源下拉 + 模型输入：模型可自由填，候选只是提示
+     （HTTP 接口的型号没法枚举，CLI 的候选也不该限制用户填别的） */
+  .sel .dd.combo { width: 150px; }
+  .sel .model-input {
+    width: 150px; height: 28px; padding: 6px 9px; border-radius: 7px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    font-family: var(--mono); font-size: 11.5px;
+  }
+  .sel .model-input:focus { outline: none; border-color: var(--accent); }
+  .sel .model-input::placeholder { color: var(--faint); }
+  .sel .model-input:disabled { opacity: .6; }
+  /* 三个节点各一组选择器：一行放不下就换行，但一组不拆开 */
+  .nodes-row { row-gap: 8px; }
+  .cfg-row .dd { display: flex; width: 100%; }
+  .cfg-select {
+    width: 100%; max-width: 280px;
+    padding: 7px 10px; font-family: var(--mono); font-size: 12px;
+  }
   .composer-hint { font-size: 11.5px; color: var(--faint); }
   /* 引导投给谁：就在输入框下面选，别再去右边面板找 */
   .guide-targets {
@@ -819,6 +889,8 @@
   .cfg-tabs {
     flex: 0 0 132px; display: flex; flex-direction: column; gap: 2px;
     padding: 12px 8px; border-right: 1px solid var(--border); background: var(--panel-2);
+    /* 来源可以有很多个，一列放不下就自己滚 */
+    overflow-y: auto;
   }
   .cfg-tabs button {
     appearance: none; border: 0; background: transparent; text-align: left;

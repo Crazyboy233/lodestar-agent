@@ -1,54 +1,96 @@
 # ============================================================
-# 主 agent 配置（走你自己的 DeepSeek API）
+# 模型来源：一条来源 = 一条能产出模型调用的通道
 # ============================================================
-main_agent:
-  # DeepSeek 官方地址；若用中转/代理，改成对应的 OpenAI 兼容 base_url
-  base_url: "https://api.deepseek.com"
-  # 不要在这里写 key（本文件会进版本库）：
-  # 放到 config.local.yaml 的 main_agent.api_key（已 gitignore），或设环境变量 DEEPSEEK_API_KEY
-  api_key: ""
-  model: "deepseek-flash"        # 官方线路: deepseek-chat / deepseek-reasoner；若供应商提供 flash 型号，改成对应 id
-  temperature: 0.2
-  max_retries: 3                # 主 agent 模型请求失败时的重试次数，超限则终止流程
-  plan_retries: 2               # 拆解任务方案时，输出解析不成 JSON 的重试次数（与上面的请求重试分开计）
+# kind: api  → OpenAI 兼容的 HTTP 接口
+# kind: cli  → 本机 CLI（codebuddy / codex / trae …）
+#
+# 同一个来源可以同时给三个节点用，也可以三个节点各用一个来源 —— 全看下面 nodes 怎么配。
+providers:
+  # DeepSeek 官方接口；若用中转/代理，改成对应的 OpenAI 兼容 base_url
+  api:
+    kind: api
+    base_url: "https://api.deepseek.com"
+    # 不要在这里写 key（本文件会进版本库）：
+    # 放到 config.local.yaml 的 providers.api.api_key，或设环境变量 DEEPSEEK_API_KEY
+    api_key: ""
+    temperature: 0.2               # 这个来源当 worker 用时（工具循环）的温度
+    timeout_seconds: 600
+
+  # 本机 codebuddy CLI 的无头模式
+  codebuddy:
+    kind: cli
+    command: "codebuddy"           # 可执行名或绝对路径
+    dialect: "codebuddy"           # 参数形状 + 输出解析；见 lodestar_agent/providers/cli/dialect.py
+    env: {}                        # 额外注入给子进程的环境变量，如 CODEBUDDY_AUTH_TOKEN
+    timeout_seconds: 600           # 当纯文本模型用时，单次调用的墙钟上限
+    chat_tools: ""                 # 当纯文本模型用时传的工具参数；留空 = 不传，由 CLI 决定
+    chat_cwd: ""                   # 纯文本调用在哪个目录跑；留空 = 配置文件所在目录
+
+  # 想接 codex / trae / 其它 OpenAI 兼容网关，照下面这段抄一份即可（不用改代码）：
+  # codex:
+  #   kind: cli
+  #   command: "codex"
+  #   dialect: "template"          # 用它自己的参数模板，而不是内置的 codebuddy 方言
+  #   args:                        # 每项是字符串，或一组参数（组内占位符为空则整组跳过）
+  #     - ["exec", "{prompt}"]
+  #     - ["--model", "{model}"]
+  #   output: "text"               # text / json（json 会取最后一个 JSON 的 result 字段）
+  #   resume_args: ["resume", "{session}"]
+  #   session_regex: "session id: ([A-Za-z0-9-]+)"
+  #
+  # 另一个 OpenAI 兼容网关（比如某个中转站）：
+  # openrouter:
+  #   kind: api
+  #   base_url: "https://openrouter.ai/api/v1"
+  #   api_key: ""
 
 # ============================================================
-# worker agent 配置（复用本机 codebuddy CLI 的无头模式）
+# 三个节点：各选一个来源 + 一个模型
 # ============================================================
-worker:
-  cli: "codebuddy"
-  model: ""                     # 留空 = 用 CLI 默认模型；也可填 deepseek-v4.1-flash 等
-  workdir: "./workspace"        # worker 的落地目录（它的 cwd）
-  timeout_seconds: 600          # 单个子任务超时；超时后重试会接着同一个 CLI 会话续跑
-  max_turns: 0                  # 单次执行最多多少轮；0 = 不传 --max-turns（CLI 非交互默认 500）
-  max_retries: 2                # 执行失败（超时/429/CLI 报错）重试次数，超限则终止流程
-  allowed_tools: "Read,Write,Edit,Bash"
-  add_dirs: []                  # 需要额外授权的目录，如 [".."]
-  # 额外注入给 worker 的环境变量（一般不用；若要免登录用 token，取消注释）
-  # env:
-  #   CODEBUDDY_AUTH_TOKEN: "在这里填你的 CodeBuddy token"
+# source 必须是 providers 里的某个 key。三个节点彼此独立，随便混搭：
+#   主 agent 用 API、worker 用 codebuddy、验收用另一个 CLI —— 都可以。
+nodes:
+  # 主 agent：拆方案、每轮动态决策、汇总 —— 只调模型，不碰文件
+  main:
+    source: "api"
+    model: "deepseek-flash"        # 官方线路: deepseek-chat / deepseek-reasoner
+    temperature: 0.2
+    max_retries: 3                 # 请求失败重试次数，超限则终止流程
+    plan_retries: 2                # 拆解结果不是合法 JSON 时的重试次数（与上面分开计）
 
-# ============================================================
-# 验收 agent 配置（独立模型、独立会话，同样走 codebuddy CLI）
-# ============================================================
-verifier:
-  cli: "codebuddy"
-  model: ""                     # 想换第三个模型就填这里，如 deepseek-v4.1-flash；留空用 CLI 默认
-  timeout_seconds: 180
-  allowed_tools: "Read,Write,Bash"  # 自己写 test 脚本需要 Write；被测目录只读，脚本写到 scratch_dir
-  scratch_dir: ".verify"        # 测试脚本目录（相对 workdir），避免污染 worker 产出
-  max_rounds: 3                 # 同一条子任务最多「执行 → 验收」几轮，防死循环
-  max_retries: 2                # 验收 agent 自身请求失败重试次数，超限则终止流程
+  # worker：真正动手改文件的执行节点
+  worker:
+    source: "codebuddy"
+    model: ""                      # 留空 = 该来源的默认模型
+    workdir: "./workspace"         # 落地目录（它的 cwd）
+    allowed_tools: "Read,Write,Edit,Bash"
+    timeout_seconds: 600           # 单次调用墙钟上限；超时重试会接着同一个会话续跑
+    max_turns: 0                   # CLI：0 = 不传；API：工具循环轮数（0 取默认）
+    max_retries: 2                 # 执行失败（超时/429/接口报错）重试次数
+    add_dirs: []                   # 需要额外授权的目录，如 [".."]
+    env: {}                        # 只给这个节点加的环境变量
+
+  # 验收：独立会话，自己写 test 脚本自己跑
+  verifier:
+    source: "codebuddy"
+    model: ""                      # 建议和 worker 不同，判定才真正独立
+    allowed_tools: "Read,Write,Bash"   # 写 test 脚本需要 Write
+    scratch_dir: ".verify"         # 测试脚本目录（相对 workdir），避免污染产出
+    timeout_seconds: 180
+    max_rounds: 3                  # 同一条子任务最多「执行 → 验收」几轮，防死循环
+    max_retries: 2                 # 验收节点自身请求失败重试次数
+    env: {}
 
 # ============================================================
 # Web 控制台（引导 / 边界退出 / 实时输出）
 # 也可以不改这里，直接用命令行 --web --port 启动
 # ============================================================
 ui:
-  web: false                    # true = 不写 --web 也默认开控制台
-  host: "127.0.0.1"             # 只监听本机；要暴露到局域网改成 0.0.0.0
-  port: 8788                    # 被占用时自动回退到随机端口（实际地址会打印出来）
-  drain_timeout_seconds: 120    # 点退出后最多再等多久：等当前这次模型回复跑完，超时才强杀
-  # 页面上「worker / 验收」两个下拉的候选模型；不写就用内置列表（取自 codebuddy --help）。
+  web: false                       # true = 不写 --web 也默认开控制台
+  host: "127.0.0.1"                # 只监听本机；要暴露到局域网改成 0.0.0.0
+  port: 8788                       # 被占用时自动回退到随机端口（实际地址会打印出来）
+  drain_timeout_seconds: 120       # 点退出后最多再等多久：等当前这次模型回复跑完，超时才强杀
+  # 页面下拉的候选模型，按来源分组；不写就用该来源的默认候选（CLI 取自 `codebuddy --help`）。
   # 空字符串 = 不传 --model，由 CLI 自己决定。
-  # models: ["", "deepseek-v4.1-flash", "deepseek-v4-pro", "glm-5.3", "kimi-k3.1-pro"]
+  # models:
+  #   codebuddy: ["", "deepseek-v4.1-flash", "deepseek-v4-pro", "glm-5.3", "kimi-k3.1-pro"]

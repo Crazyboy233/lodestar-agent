@@ -88,9 +88,9 @@ export default function App() {
   const start = useCallback(async (p: StartPayload): Promise<string | null> => {
     const res = await runCommand({
       goal: p.goal,
-      workerModel: p.workerModel,
-      verifierModel: p.verifierModel,
       workdir: p.workdir,
+      // 新建任务时三个节点都显式给出，避免「页面显示 A、后端用了 B」
+      nodes: p.nodes,
     });
     if (!res.ok || !res.session) return res.error ?? '启动失败';
     const session = res.session;
@@ -121,8 +121,7 @@ export default function App() {
       resume: true,
       workdir: item.workdir || undefined,
       seedNotes: note ? [note] : undefined,
-      workerModel: models.worker,
-      verifierModel: models.verifier,
+      nodes: models,
     });
     if (!res.ok || !res.session) return res.error ?? '续跑失败';
     const session = res.session;
@@ -184,14 +183,11 @@ export default function App() {
     }));
   }, [showWelcome]);
 
-  const onSaved = useCallback((cfg: ConfigView) => {
-    setMeta((prev) => ({
-      ...prev,
-      models: cfg.ui.models.split('\n').map((s) => s.trim()).filter(Boolean),
-      workerModel: String(cfg.worker.model ?? ''),
-      verifierModel: String(cfg.verifier.model ?? ''),
-    }));
+  // 保存设置后重新取一次 /state：来源清单、各节点当前值、默认目录都以服务端为准，
+  // 不在前端拼第二份「配置 → meta」的映射（那种重复迟早对不上）。
+  const onSaved = useCallback((_cfg: ConfigView) => {
     void fetchState().then((snap) => {
+      setMeta(snap.meta);
       const wd = snap.workdir || snap.meta?.workdir || '';
       setWorkdir(wd);
       // 设置里改了「默认产出目录」：顺手更新首页记住的目录，
@@ -297,8 +293,9 @@ export default function App() {
                       meta={meta}
                       defaultWorkdir={workdir || meta.workdir}
                       currentModels={{
-                        worker: run.session.workerModel || meta.workerModel,
-                        verifier: run.session.verifierModel || meta.verifierModel,
+                        main: run.session.nodes?.main?.label || meta.nodes.main.label,
+                        worker: run.session.nodes?.worker?.label || meta.nodes.worker.label,
+                        verifier: run.session.nodes?.verifier?.label || meta.nodes.verifier.label,
                       }}
                       preset={preset}
                       onStart={start}

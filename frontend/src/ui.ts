@@ -1,4 +1,6 @@
-import type { NodeName, RunMeta, RunState, SessionState, TaskItem, TaskStatus, TaskSummary } from './types';
+import type {
+  NodeId, NodeName, RunMeta, RunState, SessionState, SourceInfo, TaskItem, TaskStatus, TaskSummary,
+} from './types';
 
 export const STATE_TEXT: Record<RunState | SessionState, string> = {
   idle: '待开始',
@@ -84,14 +86,24 @@ export function fmtFullTime(tsSeconds: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/** 模型下拉的候选：空串 = 「CLI 决定」，永远排第一；配置里的列表 + 当前生效值都放进来 */
-export function modelOptions(meta: RunMeta): string[] {
+/** 三个节点在人话里的名字（和日志里的 PLAN / WORK / VERIFY 对应） */
+export const NODE_TEXT: Record<NodeId, string> = {
+  main: '主 agent',
+  worker: 'worker',
+  verifier: '验收',
+};
+
+/** 某类角色能用的来源：纯文本节点只能选支持 chat 的，干活的节点只能选支持 agent 的 */
+export function sourcesFor(meta: RunMeta, need: 'chat' | 'agent'): SourceInfo[] {
+  return (meta.sources ?? []).filter((s) => (s.capabilities ?? []).includes(need));
+}
+
+/** 某个来源的模型候选：空串 = 「默认模型」，永远排第一 */
+export function modelOptions(meta: RunMeta, source: string): string[] {
+  const found = (meta.sources ?? []).find((s) => s.name === source);
   const base = [''];
-  for (const m of meta.models ?? []) {
+  for (const m of found?.models ?? []) {
     if (m && !base.includes(m)) base.push(m);
-  }
-  for (const v of [meta.workerModel, meta.verifierModel]) {
-    if (v && !base.includes(v)) base.push(v);
   }
   return base;
 }

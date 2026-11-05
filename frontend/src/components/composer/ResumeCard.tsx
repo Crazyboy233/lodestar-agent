@@ -1,27 +1,38 @@
-import { useEffect, useMemo, useState } from 'react';
-import { STATE_TEXT, modelOptions } from '../../ui';
+import { useEffect, useState } from 'react';
+import { modelOptions, NODE_TEXT, sourcesFor, STATE_TEXT } from '../../ui';
 import { ComposerTextarea } from './ComposerTextarea';
 import { GuideTargets, type NoteTarget } from './GuideTargets';
-import { KEEP_MODEL, ModelPicker } from './ModelPicker';
-import type { CardProps } from './types';
+import { KEEP, NodePicker, type NodeChoice } from './NodePicker';
+import type { CardProps, NodeChoices, ResumeModels } from './types';
+import type { NodeId } from '../../types';
 
 /** 确认态几秒后自己撤销：避免很久以后再点一下就直接开跑 */
 const ARM_TIMEOUT_MS = 5000;
 
 /** 待续跑：会话信息 + 可选引导 + 模型 + 二次确认 */
+const NODES: NodeId[] = ['main', 'worker', 'verifier'];
+const NEED: Record<NodeId, 'chat' | 'agent'> = {
+  main: 'chat',
+  worker: 'agent',
+  verifier: 'agent',
+};
+const KEPT: NodeChoices = {
+  main: { source: KEEP, model: '' },
+  worker: { source: KEEP, model: '' },
+  verifier: { source: KEEP, model: '' },
+};
+
 export function ResumeCard({
   variant, meta, currentModels, onResume, onNewTask,
 }: CardProps<'resume'>) {
   const { item } = variant;
   const [target, setTarget] = useState<NoteTarget>('main');
   const [note, setNote] = useState('');
-  const [workerModel, setWorkerModel] = useState(KEEP_MODEL);
-  const [verifierModel, setVerifierModel] = useState(KEEP_MODEL);
+  const [choices, setChoices] = useState<NodeChoices>(KEPT);
   const [armed, setArmed] = useState(false);
   const [hint, setHint] = useState('');
   const [sending, setSending] = useState(false);
 
-  const models = useMemo(() => modelOptions(meta), [meta]);
   const hasNote = Boolean(note.trim());
 
   useEffect(() => {
@@ -39,15 +50,17 @@ export function ResumeCard({
     }
     setArmed(false);
     setSending(true);
-    // KEEP 就不带这个字段：后端收到 None 才叫「沿用配置」，
-    // 传空串是另一种语义（显式用 CLI 默认模型）
+    // 保持「沿用」的节点不带字段：后端收到 None 才叫「沿用配置」，
+    // 传空串是另一种语义（显式用该来源的默认模型）
+    const models: ResumeModels = {};
+    for (const node of NODES) {
+      const pick = choices[node];
+      if (pick.source !== KEEP) models[node] = { source: pick.source, model: pick.model };
+    }
     const err = await onResume(
       item,
       hasNote ? { target, text: note.trim() } : null,
-      {
-        worker: workerModel === KEEP_MODEL ? undefined : workerModel,
-        verifier: verifierModel === KEEP_MODEL ? undefined : verifierModel,
-      },
+      models,
     );
     setSending(false);
     if (err) setHint(err);
@@ -95,25 +108,20 @@ export function ResumeCard({
         </span>
       </div>
 
-      <div className="launch-opts">
-        <ModelPicker
-          label="worker"
-          value={workerModel}
-          options={models}
-          onChange={setWorkerModel}
-          keepLabel={`沿用 · ${currentModels.worker || 'CLI 决定'}`}
-          disabled={sending}
-          title="不选就沿用当前配置；选了只改这一次运行"
-        />
-        <ModelPicker
-          label="验收"
-          value={verifierModel}
-          options={models}
-          onChange={setVerifierModel}
-          keepLabel={`沿用 · ${currentModels.verifier || 'CLI 决定'}`}
-          disabled={sending}
-          title="建议和 worker 选不同的模型，判定才真正独立"
-        />
+      <div className="launch-opts nodes-row">
+        {NODES.map((node) => (
+          <NodePicker
+            key={node}
+            node={node}
+            value={choices[node]}
+            sources={sourcesFor(meta, NEED[node])}
+            models={modelOptions(meta, choices[node].source)}
+            onChange={(next: NodeChoice) => setChoices((prev) => ({ ...prev, [node]: next }))}
+            keepLabel={currentModels[node] || '当前配置'}
+            disabled={sending}
+            title={`不选就沿用当前配置；选了只改这一次运行的${NODE_TEXT[node]}`}
+          />
+        ))}
         <button
           className="ghost"
           onClick={onNewTask}

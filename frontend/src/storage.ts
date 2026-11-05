@@ -4,8 +4,8 @@ const NS = 'lodestar';
 
 export const KEY = {
   workdir: `${NS}.workdir`,
-  workerModel: `${NS}.workerModel`,
-  verifierModel: `${NS}.verifierModel`,
+  /** 上次给三个节点选的来源 + 模型 */
+  nodeChoices: `${NS}.nodeChoices`,
   collapsedProjects: `${NS}.collapsedProjects`,
 } as const;
 
