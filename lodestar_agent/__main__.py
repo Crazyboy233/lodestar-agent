@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .config import ConfigError, load_config
 from .control import Control
-from .session import Runner, run_session
+from .session import Runner, StartRequest, run_session
 from .server import ConsoleServer
 from .worker import check_cli
 
@@ -164,7 +164,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if goal or args.resume:
         try:
-            info = runner.start(goal, args.thread_id, resume=args.resume)
+            info = runner.start(
+                StartRequest(goal=goal, thread=args.thread_id, resume=args.resume)
+            )
             print(f"已自动开始: {info['thread']}  {goal or '(续跑)'}")
         except (RuntimeError, ValueError) as exc:
             print(f"[启动失败] {exc}", file=sys.stderr)

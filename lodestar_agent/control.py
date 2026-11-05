@@ -100,7 +100,7 @@ class Control:
     # ── 事件 ──────────────────────────────────────────────
     def emit(self, text: str, kind: str = "system", role: str = "log", **meta) -> dict:
         """kind: system / plan / worker / verifier / synth / stop
-        role: head（段落标题）/ prompt（派给节点的任务与验收）/ output（节点产出）/ log（旁白）/ guide（引导）
+        role: prompt（prompt 原文）/ task（任务与验收摘要）/ output（节点产出）/ log（旁白）/ guide（引导）
         """
         return self.bus.publish({
             "type": "log", "kind": kind, "text": text, "meta": {**meta, "role": role},
@@ -240,6 +240,16 @@ class Control:
         )
         self.status("busy" if self._busy else "running", self._stage)
         return note
+
+    def push_notes(self, notes) -> list[dict]:
+        """批量投递（开跑前的 seed 引导用）：跳过空内容和不认识的收件人。"""
+        out: list[dict] = []
+        for note in notes or ():
+            target = str(note.get("target") or "main").strip()
+            text = str(note.get("text") or "").strip()
+            if text and target in self.TARGETS:
+                out.append(self.push_note(target, text))
+        return out
 
     def take_notes(self, target: str) -> list[dict]:
         """取走该收件人的全部待投递引导（消费即清空）。"""

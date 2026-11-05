@@ -423,6 +423,12 @@ def run_cli(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        # 显式 utf-8：不写就跟着系统 locale（Windows 会是 GBK）。
+        # errors=replace 是必须的：子进程被强杀时最后一行 JSON 可能截断在多字节字符中间，
+        # 严格解码会抛 UnicodeDecodeError，把整次运行变成「运行异常」，
+        # 反而看不到「其实是轮次/超时结束」的真相。位置 131071 = 128KiB 管道边界，就是这个场景。
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     if os.name != "nt":
         popen_kwargs["start_new_session"] = True
@@ -483,6 +489,23 @@ def run_cli(
     if "Authentication required" in raw:
         return CliResult(ok=False, output="", duration=duration, error=AUTH_HINT)
 
+    # 轮次上限：CLI 自己停的，不是崩溃。单独给一条能照做的提示，
+    # 否则页面上只有一句 "Max turns (15) exceeded"，看不出该怎么改。
+    failed = proc.returncode != 0 or bool((data or {}).get("is_error"))
+    if failed and "max turns" in raw.lower():
+        limit_desc = f"--max-turns {max_turns}" if max_turns and max_turns > 0 else "CLI 默认上限"
+        return CliResult(
+            ok=False,
+            output=_partial_output(data),
+            duration=duration,
+            session_id=(data or {}).get("session_id"),
+            error=(
+                f"worker 到达执行轮次上限（{limit_desc}），CLI 主动停下："
+                "把 config.yaml / 设置里的 worker.max_turns 调大（0 = 不传，用 CLI 默认 500），"
+                "或者把这条任务拆小一点。已改动的文件还在产出目录里。"
+            ),
+        )
+
     if proc.returncode != 0:
         return CliResult(
             ok=False,
@@ -506,6 +529,15 @@ def run_cli(
         session_id=data.get("session_id"),
         error=(output[:800] if is_error else None),
     )
+
+
+def _partial_output(data: dict | None) -> str:
+    """CLI 中途停下时尽量捞回它已经产出的那段文字，别让页面上一片空白。"""
+    if not isinstance(data, dict):
+        return ""
+    value = data.get("result") or data.get("message") or ""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return _clip(text, 800)
 
 
 def run_worker(

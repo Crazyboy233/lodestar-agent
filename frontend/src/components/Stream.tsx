@@ -17,7 +17,10 @@ const ROLE_TEXT: Record<LogRole, string> = {
   // 章节标题也属于旁白：它是脚本打的流程说明，不是模型说的话。
   // head 保留只为兼容旧事件（那时候标题单独一类，没有标签）。
   head: '旁白',
+  // 派发只给 prompt 原文：节点真正收到的整段输入
   prompt: '派发',
+  // 任务是从 plan 结果里摘出来的人读版，不是任何一次调用的 prompt
+  task: '任务',
   output: '输出',
   log: '旁白',
   guide: '引导',

@@ -30,12 +30,50 @@ from .config import as_editable, collect_overrides, save_overrides
 from .control import Control
 from .fspick import PickUnavailable, pick_directory
 from .history import HistoryStore
+from .session import StartRequest
 
 _STATIC = (Path(__file__).resolve().parent / "static").resolve()
 
 # 前端每次都要拿最新的：否则改完前端重启进程，浏览器还在用旧产物，
 # 表现就是「点了没反应 / 少了个按钮」，而终端一切正常，极难查。
 _NO_STORE = {"Cache-Control": "no-store, must-revalidate"}
+
+
+# seed 引导的接收上限：够用又不会被一段超长文本拖死
+_MAX_SEED_NOTES = 4
+_MAX_SEED_CHARS = 4000
+
+
+def _parse_start(payload: dict) -> StartRequest:
+    """把 POST 的 JSON 转成 StartRequest —— 传输层的类型转换、清洗、截断都在这。
+
+    业务校验（目标不能为空、线程冲突）留给 `StartRequest.normalized()` 和 Runner，
+    这样 CLI 与页面走的是同一套规则。
+    """
+    def opt_str(key: str) -> str | None:
+        value = payload.get(key)
+        return None if value is None else str(value)
+
+    seeds: list[dict] = []
+    raw = payload.get("seed_notes")
+    if isinstance(raw, list):
+        for item in raw[:_MAX_SEED_NOTES]:
+            if not isinstance(item, dict):
+                continue
+            target = str(item.get("target") or "main").strip()
+            text = str(item.get("text") or "").strip()
+            if text and target in Control.TARGETS:
+                seeds.append({"target": target, "text": text[:_MAX_SEED_CHARS]})
+
+    return StartRequest(
+        goal=str(payload.get("goal") or ""),
+        thread=opt_str("thread"),
+        resume=bool(payload.get("resume")),
+        worker_model=opt_str("worker_model"),
+        verifier_model=opt_str("verifier_model"),
+        workdir=opt_str("workdir"),
+        seed_notes=tuple(seeds),
+    )
 
 
 def _snapshot(control: Control, meta: dict, runner) -> dict:
@@ -151,33 +189,10 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
         if kind == "run":
             if runner is None:
                 return JSONResponse({"ok": False, "error": "当前进程没有绑定运行器"}, status_code=400)
-            goal = str(payload.get("goal") or "").strip()
-            thread = str(payload.get("thread") or "").strip() or None
-            resume = bool(payload.get("resume"))
-            worker_model = payload.get("worker_model")
-            verifier_model = payload.get("verifier_model")
-            workdir = payload.get("workdir")
-            # 续跑前写好的引导：跟这次 run 一起投进信箱（开跑那一刻不会被 reset 冲掉）
-            seed_notes: list[dict] = []
-            raw_seed = payload.get("seed_notes")
-            if isinstance(raw_seed, list):
-                for item in raw_seed[:4]:
-                    if not isinstance(item, dict):
-                        continue
-                    target = str(item.get("target") or "main").strip()
-                    text = str(item.get("text") or "").strip()
-                    if target in Control.TARGETS and text:
-                        seed_notes.append({"target": target, "text": text[:4000]})
-            if not goal and not resume:
-                return JSONResponse({"ok": False, "error": "目标不能为空"}, status_code=400)
+            # 续跑前写好的引导也在里面：跟这次 run 一起投进信箱，
+            # 开跑那一刻不会被 reset 冲掉
             try:
-                info = runner.start(
-                    goal, thread, resume=resume,
-                    worker_model=None if worker_model is None else str(worker_model),
-                    verifier_model=None if verifier_model is None else str(verifier_model),
-                    workdir=None if workdir is None else str(workdir),
-                    seed_notes=seed_notes,
-                )
+                info = runner.start(_parse_start(payload))
             except RuntimeError as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=409)
             except ValueError as exc:

@@ -82,8 +82,13 @@ export interface Status {
 
 export type LogKind = 'system' | 'plan' | 'worker' | 'verifier' | 'synth' | 'stop' | 'note';
 
-/** 这一条属于哪一类内容：标题 / 派给节点的 prompt / 节点输出 / 旁白 / 引导 */
-export type LogRole = 'head' | 'prompt' | 'output' | 'log' | 'guide';
+/**
+ * 这一条属于哪一类内容：
+ * prompt = 模型调用真正收到的 prompt 原文；task = 从结果里摘出的任务与验收；
+ * output = 节点产出；log = 旁白；guide = 用户投递的引导；
+ * head = 旧事件里的章节标题（现在统一归 log）
+ */
+export type LogRole = 'head' | 'prompt' | 'task' | 'output' | 'log' | 'guide';
 
 export interface LogEvent {
   seq: number;

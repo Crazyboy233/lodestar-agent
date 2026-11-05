@@ -1,205 +1,136 @@
-import { useCallback, useEffect, useState } from 'react';
-import type {
-  ConfigView, HistoryDetail, HistoryGroups, LogEvent, NoteItem, RunMeta,
-  ServerEvent, Session, Status, TaskItem, TaskSummary,
-} from './types';
-import { EMPTY_META, EMPTY_SESSION, EMPTY_STATUS } from './types';
-import {
-  command, fetchHistory, fetchHistoryDetail, fetchState, reportClient,
-} from './api';
-import { useStream } from './hooks/useStream';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { ConfigView, HistoryDetail, RunMeta } from './types';
+import { EMPTY_META } from './types';
+import { command, fetchState, reportClient, runCommand } from './api';
+import { KEY, writeText } from './storage';
+import { useRunSession } from './hooks/useRunSession';
+import { useHistory } from './hooks/useHistory';
+import { useUiMode } from './hooks/useUiMode';
 import { Header } from './components/Header';
 import { Sidebar } from './components/Sidebar';
 import { Workbar } from './components/Workbar';
-import { LaunchPanel, type StartPayload } from './components/LaunchPanel';
+import {
+  Composer, type ComposerVariant, type Preset, type ResumeModels,
+  type SeedNote, type StartPayload,
+} from './components/Composer';
 import { Stream } from './components/Stream';
 import { TaskPanel } from './components/TaskPanel';
-import { GuidePanel } from './components/GuidePanel';
+import { NoteList } from './components/NoteList';
 import { QuitPanel } from './components/QuitPanel';
 import { ConfigDialog } from './components/ConfigDialog';
 import { HistoryView } from './components/HistoryView';
-import { ResumePanel, type ResumeModels, type SeedNote } from './components/ResumePanel';
 
-const EMPTY_SUMMARY: TaskSummary = { total: 0, done: 0, passed: 0, failed: 0 };
-const EMPTY_HISTORY: HistoryGroups = { ok: true, total: 0, projects: [] };
-
-type View = 'launch' | 'run' | 'history';
+const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 export default function App() {
-  const [session, setSession] = useState<Session>(EMPTY_SESSION);
-  const [status, setStatus] = useState<Status>(EMPTY_STATUS);
+  const run = useRunSession();
+  const ui = useUiMode(run.session.state);
+  const history = useHistory({ polling: run.session.state === 'running' });
+
   const [meta, setMeta] = useState<RunMeta>(EMPTY_META);
   const [workdir, setWorkdir] = useState('');
-  const [events, setEvents] = useState<LogEvent[]>([]);
-  const [tasks, setTasks] = useState<TaskItem[]>([]);
-  const [summary, setSummary] = useState<TaskSummary>(EMPTY_SUMMARY);
-  const [notes, setNotes] = useState<NoteItem[]>([]);
-  const [elapsed, setElapsed] = useState({ base: 0, at: Date.now() });
-  const [drainStart, setDrainStart] = useState<number | null>(null);
-  const [forceLaunch, setForceLaunch] = useState(false);
-  const [preset, setPreset] = useState<{ goal: string; workdir: string; n: number } | null>(null);
+  const [preset, setPreset] = useState<Preset | null>(null);
   // 调试入口：?cfg=1 直接打开设置窗口
   const [cfgOpen, setCfgOpen] = useState(
     () => new URLSearchParams(location.search).has('cfg'),
   );
 
-  const [history, setHistory] = useState<HistoryGroups>(EMPTY_HISTORY);
-  const [historyLoading, setHistoryLoading] = useState(true);
-  const [selected, setSelected] = useState<string | null>(null);
-  // 「准备续跑」的会话：从历史点进来先挂在这里，确认之后才真正开跑
-  const [resumeDraft, setResumeDraft] = useState<HistoryDetail | null>(null);
-  const [detail, setDetail] = useState<HistoryDetail | null>(null);
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [detailError, setDetailError] = useState('');
+  const { applySnapshot, adopt, requestStop } = run;
+  const { refresh, load, clearDetail } = history;
+  const { runStarted, showWelcome, focusRun, openThread, closeThread } = ui;
+  const prepareResumeUi = ui.prepareResume;
 
-  const refreshHistory = useCallback(async () => {
-    try {
-      const data = await fetchHistory();
-      setHistory(data);
-    } catch (err) {
-      reportClient('读取历史失败：' + (err instanceof Error ? err.message : String(err)));
-    } finally {
-      setHistoryLoading(false);
-    }
-  }, []);
-
-  useEffect(() => { void refreshHistory(); }, [refreshHistory]);
-
-  // 运行中定时刷新：新会话是后台线程写 history.json 的，开始那一刻可能还没落盘，
-  // 不补这一次，左侧要等任务跑完才冒出「运行中」的会话。
-  useEffect(() => {
-    if (session.state !== 'running') return;
-    const first = window.setTimeout(() => void refreshHistory(), 1200);
-    const timer = window.setInterval(() => void refreshHistory(), 6000);
-    return () => {
-      window.clearTimeout(first);
-      window.clearInterval(timer);
-    };
-  }, [session.state, refreshHistory]);
-
-  const onEvent = useCallback((ev: ServerEvent) => {
-    switch (ev.type) {
-      case 'log':
-        setEvents((prev) => {
-          const next = [...prev, {
-            seq: ev.seq, ts: ev.ts, kind: ev.kind, text: ev.text,
-            hr: ev.meta?.hr, role: ev.meta?.role,
-          }];
-          return next.length > 2500 ? next.slice(next.length - 2500) : next;
-        });
-        break;
-      case 'status':
-        setStatus(ev as unknown as Status);
-        setElapsed({ base: ev.elapsed, at: Date.now() });
-        break;
-      case 'session':
-        setSession((prev) => ({
-          ...prev,
-          state: ev.state,
-          goal: ev.goal ?? prev.goal,
-          thread: ev.thread ?? prev.thread,
-          code: ev.code ?? prev.code,
-          error: ev.error ?? prev.error,
-          workdir: ev.workdir ?? prev.workdir,
-        }));
-        if (ev.workdir) setWorkdir(ev.workdir);
-        if (ev.state === 'running') {
-          setForceLaunch(false);
-          setDrainStart(null);
-          setSelected(null);
-          setResumeDraft(null);
-          void refreshHistory();
-        } else {
-          void refreshHistory();
-        }
-        break;
-      case 'tasks':
-        setTasks(ev.tasks);
-        setSummary(ev.summary);
-        break;
-      case 'note':
-        setNotes((prev) => [...prev.filter((n) => n.id !== ev.note.id), ev.note]);
-        break;
-      case 'note_consumed':
-        setNotes((prev) => prev.map((n) => (
-          ev.ids.includes(n.id) ? { ...n, consumed: true } : n
-        )));
-        break;
-      case 'reset':
-        // 旧事件已经由 useStream 按 seq 过滤掉，这里只清界面状态
-        setEvents([]);
-        setTasks([]);
-        setNotes([]);
-        setSummary(EMPTY_SUMMARY);
-        setDrainStart(null);
-        break;
-      case 'stop':
-        setDrainStart(Date.now());
-        break;
-      default:
-        break;
-    }
-  }, [refreshHistory]);
-
-  const { connected } = useStream(onEvent);
-
+  // 初次加载：GET /state 铺底（session / status / meta / 产出目录）
   useEffect(() => {
     fetchState()
       .then((snap) => {
-        setSession(snap.session);
-        setStatus(snap as unknown as Status);
+        applySnapshot(snap);
         setMeta(snap.meta);
         setWorkdir(snap.workdir || snap.meta?.workdir || '');
-        setElapsed({ base: snap.elapsed ?? 0, at: Date.now() });
-        if (snap.stop_requested) {
-          setDrainStart(Date.now() - (snap.waited ?? 0) * 1000);
-        }
       })
-      .catch((err: unknown) => {
-        reportClient('初始 /state 失败：' + (err instanceof Error ? err.message : String(err)));
-      });
-  }, []);
+      .catch((err: unknown) => reportClient('初始 /state 失败：' + errText(err)));
+  }, [applySnapshot]);
 
-  const view: View = selected
-    ? 'history'
-    : (forceLaunch || session.state === 'idle' ? 'launch' : 'run');
+  // 运行状态的迁移只在这里收口：开跑就清掉临时视图状态，结束就刷新左侧历史。
+  // （以前这段逻辑散在 start / resume / SSE / 三个入口里各写一遍）
+  const prevRunState = useRef(run.session.state);
+  useEffect(() => {
+    const next = run.session.state;
+    if (next === prevRunState.current) return;
+    prevRunState.current = next;
+    if (next === 'running') runStarted();
+    if (next !== 'idle') void refresh();
+  }, [run.session.state, runStarted, refresh]);
 
   useEffect(() => {
-    document.body.dataset.view = view;
-  }, [view]);
+    document.body.dataset.view = ui.screen;
+  }, [ui.screen]);
 
-  const start = useCallback(async (payload: StartPayload): Promise<string | null> => {
-    const res = await command({
-      type: 'run',
-      goal: payload.goal,
-      worker_model: payload.workerModel,
-      verifier_model: payload.verifierModel,
-      workdir: payload.workdir || null,
+  const start = useCallback(async (p: StartPayload): Promise<string | null> => {
+    const res = await runCommand({
+      goal: p.goal,
+      workerModel: p.workerModel,
+      verifierModel: p.verifierModel,
+      workdir: p.workdir,
     });
     if (!res.ok || !res.session) return res.error ?? '启动失败';
-    setSession(res.session);
+    adopt(res.session);
     if (res.session.workdir) setWorkdir(res.session.workdir);
-    setForceLaunch(false);
-    setSelected(null);
-    setResumeDraft(null);
-    void refreshHistory();
     return null;
-  }, [refreshHistory]);
+  }, [adopt]);
 
-  const sendNote = useCallback(async (
+  const guide = useCallback(async (
     target: 'main' | 'worker', text: string,
   ): Promise<string | null> => {
     const res = await command({ type: 'guide', target, text });
-    if (!res.ok) return res.error ?? '发送失败';
-    return null;
+    return res.ok ? null : (res.error ?? '发送失败');
   }, []);
 
-  const stop = useCallback(async (): Promise<string | null> => {
-    const res = await command({ type: 'stop' });
-    if (!res.ok) return res.error ?? '请求失败';
-    setDrainStart(Date.now());
+  // 真续跑：模型字段缺省 = 沿用配置；引导跟 run 一起投递，第一个节点就能看到
+  const resume = useCallback(async (
+    item: HistoryDetail, note: SeedNote | null, models: ResumeModels,
+  ): Promise<string | null> => {
+    const res = await runCommand({
+      goal: item.goal,
+      thread: item.thread,
+      resume: true,
+      workdir: item.workdir || undefined,
+      seedNotes: note ? [note] : undefined,
+      workerModel: models.worker,
+      verifierModel: models.verifier,
+    });
+    if (!res.ok || !res.session) return res.error ?? '续跑失败';
+    adopt(res.session);
     return null;
-  }, []);
+  }, [adopt]);
+
+  const openHistory = useCallback((thread: string) => {
+    // 正在跑的这一条没有「只读历史」可看：它的界面就是当前操作界面
+    if (run.session.state === 'running' && thread === run.session.thread) {
+      focusRun();
+      return;
+    }
+    openThread(thread);
+    void load(thread);
+  }, [run.session.state, run.session.thread, focusRun, openThread, load]);
+
+  const closeHistory = useCallback(() => {
+    closeThread();
+    clearDetail();
+  }, [closeThread, clearDetail]);
+
+  // 从历史「继续这个会话」= 回到操作界面挂成待续跑，真正开跑要再确认一次
+  const prepareResume = useCallback((item: HistoryDetail) => {
+    prepareResumeUi(item);
+    clearDetail();
+  }, [prepareResumeUi, clearDetail]);
+
+  const useAsNew = useCallback((item: HistoryDetail) => {
+    setPreset({ goal: item.goal, workdir: item.workdir, n: Date.now() });
+    showWelcome();
+  }, [showWelcome]);
+
+  const newTask = useCallback(() => showWelcome(), [showWelcome]);
 
   const onSaved = useCallback((cfg: ConfigView) => {
     setMeta((prev) => ({
@@ -213,137 +144,65 @@ export default function App() {
       setWorkdir(wd);
       // 设置里改了「默认产出目录」：顺手更新首页记住的目录，
       // 否则保存完还停在旧目录，看起来像没生效。
-      try {
-        if (wd) localStorage.setItem('lodestar.workdir', wd);
-      } catch {
-        /* 隐私模式下写不进去就算了 */
-      }
+      if (wd) writeText(KEY.workdir, wd);
     }).catch(() => undefined);
   }, []);
 
-  const openHistory = useCallback(async (thread: string) => {
-    // 正在跑的这一条没有「只读历史」可看：它的界面就是当前操作界面。
-    // 点它必须回到运行视图，否则会卡在历史预览里，回不到输入框和事件流。
-    if (session.state === 'running' && thread === session.thread) {
-      setSelected(null);
-      setDetail(null);
-      setDetailError('');
-      return;
+  const variant: ComposerVariant = ui.composer === 'guide'
+    ? {
+      kind: 'guide',
+      locked: run.status.state === 'draining' || run.drainStart !== null,
+      pending: run.status.pending,
     }
-    setSelected(thread);
-    setDetail(null);
-    setDetailError('');
-    setDetailLoading(true);
-    try {
-      const res = await fetchHistoryDetail(thread);
-      if (!res.ok || !res.item) throw new Error(res.error || '读取失败');
-      setDetail(res.item);
-    } catch (err) {
-      setDetailError('读取会话失败：' + (err instanceof Error ? err.message : String(err)));
-    } finally {
-      setDetailLoading(false);
-    }
-  }, [session.state, session.thread]);
+    : (ui.composer === 'resume' && ui.resume)
+      ? { kind: 'resume', item: ui.resume }
+      : { kind: 'new' };
 
-  const closeHistory = useCallback(() => {
-    setSelected(null);
-    setDetail(null);
-    setDetailError('');
-  }, []);
-
-  // 从历史「继续这个会话」= 只回到操作界面，把这条挂成待续跑，不立即开跑。
-  // 真正启动在操作页面下方的续跑条里点，且要点两次（二次确认）。
-  const prepareResume = useCallback((item: HistoryDetail) => {
-    setResumeDraft(item);
-    setSelected(null);
-    setDetail(null);
-    setDetailError('');
-    setForceLaunch(false);
-    setDetailLoading(false);
-  }, []);
-
-  // 真续跑：不传模型，沿用当前配置（避免把「默认」误当成显式覆盖）。
-  // guide 是开跑前写好的引导，跟 run 一起送过去 —— 后端在 reset 之后立刻补投，
-  // 所以续跑的第一个节点就能看到它。
-  const resumeFromHistory = useCallback(async (
-    item: HistoryDetail, guide: SeedNote | null, models: ResumeModels,
-  ): Promise<string | null> => {
-    setDetailError('');
-    const payload: Record<string, unknown> = {
-      type: 'run',
-      goal: item.goal,
-      thread: item.thread,
-      resume: true,
-      workdir: item.workdir || null,
-      seed_notes: guide ? [guide] : [],
-    };
-    // 字段缺省才叫「沿用配置」；传空串是显式指定 CLI 默认模型，两种语义别混
-    if (models.worker !== undefined) payload.worker_model = models.worker;
-    if (models.verifier !== undefined) payload.verifier_model = models.verifier;
-    const res = await command(payload);
-    if (!res.ok || !res.session) return res.error ?? '续跑失败';
-    setSession(res.session);
-    setSelected(null);
-    setResumeDraft(null);
-    setForceLaunch(false);
-    void refreshHistory();
-    return null;
-  }, [refreshHistory]);
-
-  const useAsNew = useCallback((item: HistoryDetail) => {
-    setPreset({ goal: item.goal, workdir: item.workdir, n: Date.now() });
-    setSelected(null);
-    setResumeDraft(null);
-    setForceLaunch(true);
-  }, []);
-
-  const newTask = useCallback(() => {
-    setSelected(null);
-    setResumeDraft(null);
-    setForceLaunch(true);
-  }, []);
+  const resumeDraft = ui.resume;
 
   return (
     <>
       <div className="app">
         <Sidebar
-          projects={history.projects}
-          total={history.total}
-          loading={historyLoading}
-          error={history.error}
-          selected={selected}
-          currentThread={session.state === 'running' ? session.thread : null}
-          busy={session.state === 'running'}
-          connected={connected}
+          projects={history.groups.projects}
+          total={history.groups.total}
+          loading={history.loading}
+          error={history.groups.error}
+          selected={ui.thread}
+          currentThread={run.session.state === 'running' ? run.session.thread : null}
+          busy={run.session.state === 'running'}
+          connected={run.connected}
           onNew={newTask}
           onOpenSettings={() => setCfgOpen(true)}
-          onSelect={(thread) => void openHistory(thread)}
+          onSelect={openHistory}
         />
 
         <div className="main-col">
           <Header
-            session={session}
-            status={status}
-            elapsed={elapsed}
-            drainStart={drainStart}
-            history={detail}
-            running={session.state === 'running'}
+            session={run.session}
+            status={run.status}
+            elapsed={run.elapsed}
+            drainStart={run.drainStart}
+            history={history.detail}
+            running={run.session.state === 'running'}
           />
-          <Workbar status={status} sessionState={session.state} />
+          {ui.screen === 'run' && (
+            <Workbar status={run.status} sessionState={run.session.state} />
+          )}
           <main>
-            {view === 'history' ? (
+            {ui.screen === 'history' ? (
               <HistoryView
-                detail={detail}
-                loading={detailLoading}
-                error={detailError}
-                running={session.state === 'running'}
+                detail={history.detail}
+                loading={history.detailLoading}
+                error={history.detailError}
+                running={run.session.state === 'running'}
                 onResume={prepareResume}
                 onUseAsNew={useAsNew}
                 onClose={closeHistory}
               />
             ) : (
               <>
-                {view === 'launch' ? (
+                {ui.screen === 'launch' ? (
                   <section className="stream-wrap welcome-wrap">
                     <div className="welcome">
                       <div className="welcome-mark">Lodestar</div>
@@ -352,52 +211,40 @@ export default function App() {
                     </div>
                   </section>
                 ) : (
-                  <Stream events={events} />
+                  <Stream events={run.events} />
                 )}
 
                 <div className="composer-zone">
-                  {/* 有待续跑的会话时，这里不摆新任务表单：
-                      没开跑之前的输入框既开不了新任务（会和续跑打架），也发不出引导
-                      （引导是投进运行中的实例，开始运行那一刻会被 reset 清空）。
-                      跑起来之后才切成引导框。 */}
-                  {resumeDraft ? (
-                    <ResumePanel
-                      item={resumeDraft}
-                      meta={meta}
-                      /* 上次运行用过的模型比启动时的 meta 更新：Runner.start 会改 cfg */
-                      current={{
-                        worker: session.workerModel || meta.workerModel,
-                        verifier: session.verifierModel || meta.verifierModel,
-                      }}
-                      running={session.state === 'running'}
-                      onResume={resumeFromHistory}
-                      onNewTask={() => useAsNew(resumeDraft)}
-                    />
-                  ) : (
-                    <LaunchPanel
-                      meta={meta}
-                      running={session.state === 'running'}
-                      defaultWorkdir={workdir || meta.workdir}
-                      preset={preset}
-                      onStart={start}
-                      onGuide={sendNote}
-                      guideLocked={status.state === 'draining' || drainStart !== null}
-                      pending={status.pending}
-                    />
-                  )}
+                  <Composer
+                    variant={variant}
+                    meta={meta}
+                    defaultWorkdir={workdir || meta.workdir}
+                    currentModels={{
+                      worker: run.session.workerModel || meta.workerModel,
+                      verifier: run.session.verifierModel || meta.verifierModel,
+                    }}
+                    preset={preset}
+                    onStart={start}
+                    onGuide={guide}
+                    onResume={resume}
+                    onNewTask={() => resumeDraft && useAsNew(resumeDraft)}
+                  />
                 </div>
 
-                <aside>
-                  <TaskPanel tasks={tasks} summary={summary} />
-                  <GuidePanel notes={notes} />
-                  <QuitPanel
-                    status={status}
-                    session={session}
-                    events={events}
-                    drainStart={drainStart}
-                    onStop={stop}
-                  />
-                </aside>
+                {/* 侧栏只在运行界面出现：欢迎页没有任务清单可看 */}
+                {ui.screen === 'run' && (
+                  <aside>
+                    <TaskPanel tasks={run.tasks} summary={run.summary} />
+                    <NoteList notes={run.notes} />
+                    <QuitPanel
+                      status={run.status}
+                      session={run.session}
+                      events={run.events}
+                      drainStart={run.drainStart}
+                      onStop={requestStop}
+                    />
+                  </aside>
+                )}
               </>
             )}
           </main>

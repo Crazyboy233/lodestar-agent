@@ -20,7 +20,7 @@ worker:
   model: ""                     # 留空 = 用 CLI 默认模型；也可填 deepseek-v4.1-flash 等
   workdir: "./workspace"        # worker 的落地目录（它的 cwd）
   timeout_seconds: 300          # 单个子任务超时
-  max_turns: 15                 # 单次执行最多多少轮，跑飞就提前收（透传 --max-turns）
+  max_turns: 0                  # 单次执行最多多少轮；0 = 不传 --max-turns（CLI 非交互默认 500）
   max_retries: 2                # 执行失败（超时/429/CLI 报错）重试次数，超限则终止流程
   allowed_tools: "Read,Write,Edit,Bash"
   add_dirs: []                  # 需要额外授权的目录，如 [".."]

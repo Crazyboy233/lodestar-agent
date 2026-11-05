@@ -33,7 +33,7 @@ class WorkerConfig:
     allowed_tools: str = "Read,Write,Edit,Bash"
     add_dirs: list[Path] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-    max_turns: int = 15
+    max_turns: int = 0   # 0 = 不传 --max-turns，用 CLI 默认（非交互 500）
     max_retries: int = 2
 
 
@@ -150,7 +150,7 @@ def load_config(path: str | Path = "config.yaml") -> Config:
         allowed_tools=str(worker_raw.get("allowed_tools") or "Read,Write,Edit,Bash"),
         add_dirs=add_dirs,
         env={str(k): str(v) for k, v in (worker_raw.get("env") or {}).items()},
-        max_turns=int(worker_raw.get("max_turns", 15) or 0),
+        max_turns=int(worker_raw.get("max_turns", 0) or 0),
         max_retries=max(0, int(worker_raw.get("max_retries", 2))),
     )
 

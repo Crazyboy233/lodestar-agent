@@ -1,5 +1,6 @@
 import type { HistoryDetail } from '../types';
-import { STATE_TEXT, TASK_TEXT, fmtFullTime } from '../ui';
+import { STATE_TEXT, fmtFullTime } from '../ui';
+import { TaskList } from './TaskList';
 
 interface Props {
   detail: HistoryDetail | null;
@@ -86,22 +87,7 @@ export function HistoryView({
         </h2>
 
         {detail.tasks && detail.tasks.length > 0 ? (
-          <ul className="tasks">
-            {detail.tasks.map((t, i) => (
-              <li key={`${t.task}-${i}`} data-st={t.status}>
-                <span className="tnum">{i + 1}</span>
-                <span className="tbody">
-                  <span className="ttask">{t.task || '(空任务)'}</span>
-                  <span className="tmeta">
-                    {t.status === 'pass' || t.status === 'fail' || t.status === 'skip'
-                      ? `第 ${t.attempts} 轮 · ${t.duration}s` : '未执行'}
-                    {t.reason ? ` · ${t.reason}` : ''}
-                  </span>
-                </span>
-                <span className="tst">{TASK_TEXT[t.status]}</span>
-              </li>
-            ))}
-          </ul>
+          <TaskList tasks={detail.tasks} />
         ) : (
           <div className="hist-none">这个会话没有留下任务清单</div>
         )}

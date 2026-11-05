@@ -17,6 +17,7 @@ import sys
 import textwrap
 import threading
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -30,12 +31,38 @@ from .worker import terminate_all_cli
 _DISPLAY_LIMIT = 1200
 
 
+@dataclass(frozen=True)
+class StartRequest:
+    """一次运行的入参。None 与空串的区别是契约的一部分，别随手写成 `or ""`。
+
+    - `worker_model` / `verifier_model`：None = 沿用配置；"" = 显式用 CLI 默认模型
+    - `workdir`：None / 空串 = 回到配置里的默认产出目录
+    - `seed_notes`：开跑前写好的引导，在 `reset()` 之后补投（否则会被清空）
+    """
+
+    goal: str = ""
+    thread: str | None = None
+    resume: bool = False
+    worker_model: str | None = None
+    verifier_model: str | None = None
+    workdir: str | None = None
+    seed_notes: tuple[dict, ...] = ()
+
+    def normalized(self) -> "StartRequest":
+        """把用户输入规整成可执行的值；不合法就抛 ValueError（由调用方转成 400）。"""
+        goal = (self.goal or "").strip()
+        if not goal and not self.resume:
+            raise ValueError("目标不能为空")
+        return replace(self, goal=goal, thread=(self.thread or "").strip() or None)
+
+
 class Console:
     """终端 + 页面双写。
 
     kind 决定页面上的标签与左边色条：plan / worker / verifier / synth / stop / system。
     role 决定这一条属于哪一类内容，页面据此区分「节点收到的 prompt / 节点的输出 / 旁白日志」：
-    head（段落标题）/ prompt（派给节点的任务与验收）/ output（节点产出）/ log（流程说明）。
+    prompt（模型调用真正收到的 prompt 原文）/ task（从结果里摘出的任务与验收）/
+    output（节点产出）/ log（流程说明）/ guide（用户投递的引导）。
 
     终端行为与改造前保持一致（分隔线、缩进、截断），页面拿到的内容更全（前端自己做折叠）。
     """
@@ -252,7 +279,7 @@ def run_session(
         _w(logf, f"主 agent: {cfg.main_agent.model} @ {cfg.main_agent.base_url}")
         _w(logf, f"worker: {cfg.worker.cli} (model={cfg.worker.model or 'CLI 默认'}, "
                 f"tools={cfg.worker.allowed_tools}, cwd={cfg.worker.workdir}, "
-                f"max_turns={cfg.worker.max_turns})")
+                f"max_turns={cfg.worker.max_turns or 'CLI 默认'})")
         _w(logf, f"验收: {cfg.verifier.cli} (model={cfg.verifier.model or 'CLI 默认'}, "
                 f"tools={cfg.verifier.allowed_tools}, "
                 f"cwd={cfg.worker.workdir}/{cfg.verifier.scratch_dir}, "
@@ -310,10 +337,10 @@ def run_session(
                         for i, item in enumerate(items, 1):
                             if not item:
                                 continue
-                            con.say(f"{i}. {item['task']}", kind="plan", role="prompt")
+                            con.say(f"{i}. {item['task']}", kind="plan", role="task")
                             con.say(
                                 f"   验收: {item.get('verify') or '(未给出可执行标准，由验收 agent 自行设计)'}",
-                                kind="plan", role="prompt",
+                                kind="plan", role="task",
                             )
                         current_task = (update.get("current") or {}).get("task", "")
                         _w(logf, "=" * 70)
@@ -498,47 +525,24 @@ class Runner:
             return dict(self._session)
 
     # ── 控制 ──────────────────────────────────────────────
-    def start(
-        self,
-        goal: str,
-        thread_id: str | None = None,
-        resume: bool = False,
-        worker_model: str | None = None,
-        verifier_model: str | None = None,
-        workdir: str | None = None,
-        seed_notes: list[dict] | None = None,
-    ) -> dict:
-        """开始一次运行。
-
-        worker_model / verifier_model 传 None 表示沿用配置里的值，传空字符串表示
-        「显式用 CLI 默认模型」—— 页面上那个「默认」选项就是后者。
-        workdir 同理：None 或空串 = 回到配置里的默认产出目录，否则作为本次的工作目录。
-        seed_notes 是「开跑前就写好的引导」：reset 会清空信箱，所以在这里补投，
-        保证续跑的第一个节点（第一条模型调用）就能取到。
-        一次只跑一个，所以直接改 cfg 上这几个字段是安全的。
-        """
-        goal = (goal or "").strip()
-        if not goal and not resume:
-            raise ValueError("目标不能为空")
+    def start(self, req: StartRequest) -> dict:
+        """开始一次运行。一次只跑一个，所以直接改 cfg 上那几个字段是安全的。"""
+        req = req.normalized()
         with self._lock:
             if self._thread and self._thread.is_alive():
                 raise RuntimeError("已有任务在运行，先等它结束或先点边界退出")
-            if worker_model is not None:
-                self.cfg.worker.model = worker_model.strip()
-            if verifier_model is not None:
-                self.cfg.verifier.model = verifier_model.strip()
-            self.cfg.worker.workdir = self._resolve_workdir(workdir)
-            tid = (thread_id or "").strip() or (
-                f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}"
-            )
+            if req.worker_model is not None:
+                self.cfg.worker.model = req.worker_model.strip()
+            if req.verifier_model is not None:
+                self.cfg.verifier.model = req.verifier_model.strip()
+            self.cfg.worker.workdir = self._resolve_workdir(req.workdir)
+            tid = req.thread or f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}"
             self.control.reset()
-            for note in seed_notes or []:
-                target = str(note.get("target") or "main")
-                text = str(note.get("text") or "").strip()
-                if text and target in Control.TARGETS:
-                    self.control.push_note(target, text)
+            # 开跑前的引导必须在这里补投：reset 刚把信箱清空，
+            # 而线程一旦启动就可能立刻进入第一个节点去取。
+            self.control.push_notes(req.seed_notes)
             self._session = {
-                "goal": goal, "thread": tid, "state": "running",
+                "goal": req.goal, "thread": tid, "state": "running",
                 "code": None, "started": time.time(), "ended": 0.0, "error": "",
                 "workerModel": self.cfg.worker.model,
                 "verifierModel": self.cfg.verifier.model,
@@ -546,10 +550,11 @@ class Runner:
             }
             info = dict(self._session)
             self._thread = threading.Thread(
-                target=self._body, args=(goal, tid, resume), name="lodestar-session", daemon=True
+                target=self._body, args=(req.goal, tid, req.resume),
+                name="lodestar-session", daemon=True,
             )
             self._thread.start()
-        self.control.session_event("running", goal=goal, thread=tid,
+        self.control.session_event("running", goal=req.goal, thread=tid,
                                    workdir=str(self.cfg.worker.workdir))
         return info
 

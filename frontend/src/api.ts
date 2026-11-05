@@ -66,6 +66,20 @@ export interface SaveConfigResponse {
   note?: string;
 }
 
+/** 一次 run 的前端入参：字段缺省 = 用后端的默认语义（别拿空串代替「不传」） */
+export interface RunStart {
+  goal: string;
+  thread?: string;
+  resume?: boolean;
+  /** 缺省=沿用配置；''=显式用 CLI 默认模型 */
+  workerModel?: string;
+  verifierModel?: string;
+  /** 缺省 / 空串 = 用配置里的默认产出目录 */
+  workdir?: string;
+  /** 开跑前写好的引导，跟着 run 一起投递 */
+  seedNotes?: { target: 'main' | 'worker'; text: string }[];
+}
+
 export async function command(payload: Record<string, unknown>): Promise<CommandResponse> {
   const res = await fetch('/command', {
     method: 'POST',
@@ -73,6 +87,18 @@ export async function command(payload: Record<string, unknown>): Promise<Command
     body: JSON.stringify(payload),
   });
   return json<CommandResponse>(res);
+}
+
+/** 开始一次运行（新任务 / 续跑共用）：snake_case 的协议细节只在这一处出现 */
+export function runCommand(start: RunStart): Promise<CommandResponse> {
+  const payload: Record<string, unknown> = { type: 'run', goal: start.goal };
+  if (start.thread !== undefined) payload.thread = start.thread;
+  if (start.resume !== undefined) payload.resume = start.resume;
+  if (start.workerModel !== undefined) payload.worker_model = start.workerModel;
+  if (start.verifierModel !== undefined) payload.verifier_model = start.verifierModel;
+  if (start.workdir) payload.workdir = start.workdir;
+  if (start.seedNotes?.length) payload.seed_notes = start.seedNotes;
+  return command(payload);
 }
 
 /** 让后端在本机弹出系统文件夹选择器（macOS / Windows / Linux） */

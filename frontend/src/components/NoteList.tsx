@@ -6,10 +6,10 @@ interface Props {
 }
 
 /**
- * 只负责「投递记录」：投递入口已经统一到事件流下方的对话框，
- * 这里不再重复输入框，避免两处都能发引导、看着像两套功能。
+ * 只负责「投递记录」：投递入口在事件流下方的输入区，
+ * 这里不再放输入框，避免两处都能发引导。
  */
-export function GuidePanel({ notes }: Props) {
+export function NoteList({ notes }: Props) {
   const [open, setOpen] = useState<Set<string>>(() => new Set());
   const pending = notes.filter((n) => !n.consumed).length;
 
@@ -23,7 +23,7 @@ export function GuidePanel({ notes }: Props) {
   };
 
   return (
-    <div className="card guide">
+    <div className="card notes-card">
       <div className="card-head">
         <h2>引导投递</h2>
         <span className="tasks-sum">

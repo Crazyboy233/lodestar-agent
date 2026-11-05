@@ -41,7 +41,7 @@ const SCHEMA: Group[] = [
       { key: 'workdir', label: '默认产出目录', type: 'dir', tip: '点击「选择…」打开系统文件夹选择器；每次任务还可以在首页单独指定' },
       { key: 'allowed_tools', label: '允许的工具', type: 'text', tip: '逗号分隔，例如 Read,Write,Edit,Bash' },
       { key: 'timeout_seconds', label: '单轮超时', type: 'number', step: '10', tip: '一次 CLI 调用最长跑多久（秒）' },
-      { key: 'max_turns', label: '最大轮次', type: 'number', tip: 'CLI 内部最多交互几轮' },
+      { key: 'max_turns', label: '最大轮次', type: 'number', tip: 'CLI 内部最多交互几轮；0 = 不传参，用 CLI 默认（非交互 500）' },
       { key: 'max_retries', label: '失败重试', type: 'number', tip: '执行失败后换一次机会再跑' },
       { key: 'add_dirs', label: '额外目录', type: 'lines', tip: '每行一个额外授权的目录' },
       { key: 'env', label: '环境变量', type: 'lines', tip: '每行一个 KEY=VALUE' },

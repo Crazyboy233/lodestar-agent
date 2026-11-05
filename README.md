@@ -231,7 +231,7 @@ uv run python -m lodestar_agent --web      # 不带任务
 - 跑起来之后上方开始打印执行过程，终端只是镜像；底部输入卡切成「引导」输入，旁边的按钮选投给**主 agent** 还是 **worker**，右侧「任务」面板列出拆解出的每一条及其状态（待执行 / 执行中 / 通过 / 未通过 / 未验收）和轮次、耗时，点一条就地展开看验收标准；投过的引导记在右侧「引导投递」里
 - 跑完后底部恢复为新任务输入框，上方保留刚才的执行过程；点「新任务」回到空白欢迎页
 
-事件流每行四列：**时间 · 节点**（PLAN / WORK / VERIFY / FINAL，颜色跟着节点走）**· 内容类别 · 正文**。内容类别和节点正交，用来看这条是谁的什么话：`派发` 是这次模型调用真正收到的 prompt（主 agent 拆解 / 动态决策、worker、验收，每次调用一条，原样打出全量文本）、`输出` 是节点自己的产出、`旁白` 是流程说明（含章节标题、退出 / 异常提示）、`引导` 是投递进来的指令；每条事件都有标签，没有空的。正文超过 10 行会截断并给「展开全文」按钮，不会把内容切掉看不到。
+事件流每行四列：**时间 · 节点**（PLAN / WORK / VERIFY / FINAL，颜色跟着节点走）**· 内容类别 · 正文**。内容类别和节点正交，用来看这条是谁的什么话：`派发` 是这次模型调用真正收到的 prompt（主 agent 拆解 / 动态决策、worker、验收，每次调用一条，原样打出全量文本）、`任务` 是从 plan 结果里摘出来的人读版任务与验收标准（不是 prompt，别和「派发」混）、`输出` 是节点自己的产出、`旁白` 是流程说明（含章节标题、退出 / 异常提示）、`引导` 是投递进来的指令；每条事件都有标签，没有空的。正文超过 10 行会截断并给「展开全文」按钮，不会把内容切掉看不到。
 
 历史落在项目根目录的 `history.json`（已 gitignore）：每次开始写一条，结束时补上退出码 / 耗时 / 最终答复。升级前的旧记录没有这个文件，左侧会自动从 `checkpoints.sqlite` 回填一次，不会一片空白；进程被强杀时残留的「运行中」会显示为「已退出」。历史里点开一个会话时，顶栏、任务清单、最终答复都跟着它走，不会还挂着「新任务」。
 
@@ -253,6 +253,18 @@ npm run build      # 产物写回 lodestar_agent/static/
 ```
 
 改了前端要 `npm run build`，然后刷新浏览器即可（不用重启 Python 进程）。类型检查单独跑 `npx tsc --noEmit`。
+
+前端的骨架分三层，改界面时按层找：
+
+| 位置 | 职责 |
+| --- | --- |
+| `src/hooks/useUiMode.ts` | 「哪一屏 + 哪种输入区」的唯一状态机：`launch / run / history` × `new / guide / resume`，只暴露 5 个动作 |
+| `src/hooks/useRunSession.ts` | 一次运行的可视状态 + SSE 归约（session / status / events / tasks / notes） |
+| `src/hooks/useHistory.ts` | 左侧历史的列表、轮询、以及某条会话的详情 |
+| `src/components/Composer.tsx` | 输入区的三种形态（新任务 / 引导 / 待续跑），共用 `composer/` 下的零件 |
+| `src/components/TaskList.tsx` | 任务清单，侧栏（两行截断+展开）与历史页（完整铺开）共用一套渲染 |
+
+`App.tsx` 只做接线：把 hook 的状态交给组件，把组件的回调转成命令。运行状态的变化（开跑 / 收尾）集中在一个 `useEffect` 里收口，不再在每个入口各清一遍状态。
 
 ### 页面里改配置
 
@@ -331,7 +343,7 @@ worker 跑完只差验收的，直接补验收不重跑；worker 还没开始的
 | 闸门 | 配置 | 命中后 |
 | --- | --- | --- |
 | 单条子任务的往复次数 | `verifier.max_rounds`（默认 3） | 判失败，记入汇总，继续下一条 |
-| 单次 CLI 内部轮数 | `worker.max_turns`（默认 15，透传 `--max-turns`） | CLI 自行收敛，避免一条任务跑几十轮 |
+| 单次 CLI 内部轮数 | `worker.max_turns`（默认 0 = 不传参，用 CLI 默认；非交互模式是 500） | CLI 自己停下并报 `Max turns (N) exceeded`；页面会提示怎么放宽 |
 | 单次调用墙钟 | `worker/verifier.timeout_seconds` | 终止**整棵子进程树**（POSIX 进程组 SIGTERM→SIGKILL；Windows `taskkill /T /F`） |
 | 图节点总步数 | `recursion_limit=120` | 兜底防图本身打转 |
 | 主 agent 模型请求失败 | `main_agent.max_retries`（默认 3） | 重试耗尽 → 终止流程，报失败节点+原因 |
@@ -351,7 +363,7 @@ worker 跑完只差验收的，直接补验收不重跑；worker 还没开始的
 | `worker.workdir` | 默认产出目录 / 两个 agent 的 cwd；每次任务可在页面另选 |
 | `worker.allowed_tools` / `verifier.allowed_tools` | 前者 `Read,Write,Edit,Bash`；后者 `Read,Write,Bash`（写 test 脚本需要 Write） |
 | `verifier.scratch_dir` | 测试脚本目录（相对 `workdir`），默认 `.verify` |
-| `worker.max_turns` | 单次执行最多轮数，透传 `--max-turns` |
+| `worker.max_turns` | 单次执行最多轮数，透传 `--max-turns`；**0 = 不传**，用 CLI 默认（非交互 500）。填 15 这种小值只会让正常任务被自己掐断 |
 | `verifier.max_rounds` | 同一条子任务最多「执行 → 验收」几轮 |
 | `worker.max_retries` / `verifier.max_retries` | 各自请求失败重试次数，超限终止流程 |
 | `worker.add_dirs` | 额外授权目录（默认只能动 workdir） |
