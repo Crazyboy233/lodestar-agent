@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from .config import as_editable, collect_overrides, save_overrides
 from .control import Control
 from .fspick import PickUnavailable, pick_directory
-from .history import HistoryStore
+from .history import HistoryStore, parse_log
 from .session import StartRequest
 
 _STATIC = (Path(__file__).resolve().parent / "static").resolve()
@@ -94,6 +94,9 @@ def _snapshot(control: Control, meta: dict, runner) -> dict:
         "running": bool(runner.busy) if runner is not None else False,
         "stop_requested": stopping,
         "stop_reason": control.stop_reason,
+        # 事件总线的最新 seq：页面据此决定 SSE 从哪儿开始订阅 ——
+        # 接的是已结束的那一轮就跳过它的 backlog，别让旧事件把界面重新点亮
+        "seq": control.bus.seq,
         "waited": round(time.time() - control.stop_ts, 1) if stopping else 0,
         "busy": control.busy,
         "busyDetail": control.busy_detail,
@@ -156,6 +159,37 @@ def create_app(control: Control, meta: dict, runner, stopping: threading.Event) 
         if item is None:
             return JSONResponse({"ok": False, "error": f"没有这个会话：{thread}"}, status_code=404)
         return JSONResponse({"ok": True, "item": item})
+
+    @app.get("/history/{thread}/log")
+    def get_history_log(thread: str) -> JSONResponse:
+        """一次运行的信息流：把当时那份运行日志切成事件，供「回到操作页面」回看。
+
+        日志路径来自 history.json（本进程自己写的），仍然只认 root 下的文件。
+        """
+        if runner is None:
+            return JSONResponse({"ok": False, "error": "当前进程没有绑定运行器"}, status_code=400)
+        cfg = runner.cfg
+        store = HistoryStore(cfg.root)
+        path = store.log_path(thread)
+        if path is None:
+            item = next((x for x in store.items() if x.get("thread") == thread), None)
+            if item is None:
+                return JSONResponse(
+                    {"ok": False, "error": f"没有这个会话：{thread}"}, status_code=404,
+                )
+            return JSONResponse({"ok": True, "events": [], "note": "这次运行没有留下日志"})
+        root = Path(cfg.root).expanduser().resolve()
+        try:
+            target = path.resolve()
+        except OSError:
+            return JSONResponse({"ok": True, "events": [], "note": "日志文件不在了"})
+        if not target.is_relative_to(root) or not target.is_file():
+            return JSONResponse({"ok": True, "events": [], "note": "日志文件不在了"})
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return JSONResponse({"ok": False, "error": f"读取日志失败：{exc}"}, status_code=500)
+        return JSONResponse({"ok": True, "events": parse_log(text)})
 
     @app.delete("/history/{thread}")
     def delete_history(thread: str) -> JSONResponse:

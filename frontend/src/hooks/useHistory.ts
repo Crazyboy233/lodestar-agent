@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
-import type { HistoryDetail, HistoryGroups } from '../types';
+import type { HistoryDetail, HistoryGroups, LogEvent } from '../types';
 import {
-  deleteHistory, fetchHistory, fetchHistoryDetail, reportClient,
+  deleteHistory, fetchHistory, fetchHistoryDetail, fetchHistoryLog, reportClient,
 } from '../api';
 
 const EMPTY_HISTORY: HistoryGroups = { ok: true, total: 0, projects: [] };
@@ -22,6 +22,18 @@ export function useHistory({ polling }: { polling: boolean }) {
   const [detail, setDetail] = useState<HistoryDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState('');
+  /** 回看用的事件流：null = 还没取过这个会话的日志 */
+  const [stream, setStream] = useState<LogEvent[] | null>(null);
+  const [streamLoading, setStreamLoading] = useState(false);
+  const [streamError, setStreamError] = useState('');
+  const [streamNote, setStreamNote] = useState('');
+
+  const clearStream = useCallback(() => {
+    setStream(null);
+    setStreamLoading(false);
+    setStreamError('');
+    setStreamNote('');
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -49,6 +61,7 @@ export function useHistory({ polling }: { polling: boolean }) {
     setDetail(null);
     setDetailError('');
     setDetailLoading(true);
+    clearStream();
     try {
       const res = await fetchHistoryDetail(thread);
       if (!res.ok || !res.item) throw new Error(res.error || '读取失败');
@@ -58,13 +71,33 @@ export function useHistory({ polling }: { polling: boolean }) {
     } finally {
       setDetailLoading(false);
     }
+  }, [clearStream]);
+
+  /** 回看历史记录的操作页面：把当时那份运行日志取成事件流 */
+  const loadStream = useCallback(async (thread: string) => {
+    setStream(null);
+    setStreamError('');
+    setStreamNote('');
+    setStreamLoading(true);
+    try {
+      const res = await fetchHistoryLog(thread);
+      if (!res.ok) throw new Error(res.error || '读取失败');
+      setStream(res.events);
+      setStreamNote(res.note ?? '');
+    } catch (err) {
+      setStreamError('读取信息流失败：' + errText(err));
+    } finally {
+      setStreamLoading(false);
+    }
   }, []);
 
+  /** 关掉详情就没什么可回看的了，信息流跟着一起丢掉 */
   const clearDetail = useCallback(() => {
     setDetail(null);
     setDetailLoading(false);
     setDetailError('');
-  }, []);
+    clearStream();
+  }, [clearStream]);
 
   /** 删一条历史；成功返回 null，失败返回给页面看的错误文案 */
   const remove = useCallback(async (thread: string): Promise<string | null> => {
@@ -76,6 +109,7 @@ export function useHistory({ polling }: { polling: boolean }) {
 
   return {
     groups, loading, detail, detailLoading, detailError,
-    refresh, load, clearDetail, remove,
+    stream, streamLoading, streamError, streamNote,
+    refresh, load, loadStream, clearStream, clearDetail, remove,
   };
 }

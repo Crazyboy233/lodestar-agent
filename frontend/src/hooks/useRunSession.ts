@@ -80,16 +80,35 @@ export function useRunSession() {
     }
   }, []);
 
-  const { connected } = useStream(onEvent);
+  /** SSE 从哪开始订阅；null = 还没定（等 /state 的快照） */
+  const [streamSince, setStreamSince] = useState<number | null>(null);
 
-  /** 初次加载 / 刷新页面：用 GET /state 的快照铺底 */
-  const applySnapshot = useCallback((snap: StateSnapshot) => {
-    setSession(snap.session);
-    setStatus(snap as unknown as Status);
-    setElapsed({ base: snap.elapsed ?? 0, at: Date.now() });
-    if (snap.stop_requested) {
-      setDrainStart(Date.now() - (snap.waited ?? 0) * 1000);
+  const { connected } = useStream(onEvent, streamSince);
+
+  /**
+   * 初次加载 / 刷新页面：用 GET /state 的快照铺底。
+   *
+   * 只恢复「还在跑」的那一轮。已经结束的会话属于左侧历史，刷新后应该落在新任务页，
+   * 而不是把上一次的结果当成当前界面——所以快照说结束了，就按空会话处理，
+   * 并把 SSE 起点推到快照的 seq 上，免得 backlog 里的 `session: done` 把界面又点亮。
+   * 传 null = 快照没取到，退回「不恢复、从头订阅」的旧行为。
+   */
+  const applySnapshot = useCallback((snap: StateSnapshot | null) => {
+    if (snap && snap.session.state === 'running') {
+      setSession(snap.session);
+      setStatus(snap as unknown as Status);
+      setElapsed({ base: snap.elapsed ?? 0, at: Date.now() });
+      if (snap.stop_requested) {
+        setDrainStart(Date.now() - (snap.waited ?? 0) * 1000);
+      }
+      setStreamSince(0);
+      return;
     }
+    setSession(EMPTY_SESSION);
+    setStatus(EMPTY_STATUS);
+    setElapsed({ base: 0, at: Date.now() });
+    setDrainStart(null);
+    setStreamSince(snap?.seq ?? 0);
   }, []);
 
   /** 启动成功后，直接用命令返回的 session（不用等 SSE 那一帧） */

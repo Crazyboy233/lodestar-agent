@@ -49,6 +49,12 @@ class EventBus:
                 pass
         return event
 
+    @property
+    def seq(self) -> int:
+        """当前最新事件的 seq。页面拿它当「从哪开始订阅」的分界线。"""
+        with self._lock:
+            return self._seq
+
     def subscribe(self, since: int = 0) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=self._queue_size)
         with self._lock:

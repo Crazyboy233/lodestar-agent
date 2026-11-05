@@ -8,11 +8,13 @@ interface Props {
   error: string;
   running: boolean;
   onResume: (item: HistoryDetail) => void;
+  /** 回到当时的操作页面看信息流（只读回看） */
+  onOpenStream: (item: HistoryDetail) => void;
   onClose: () => void;
 }
 
 export function HistoryView({
-  detail, loading, error, running, onResume, onClose,
+  detail, loading, error, running, onResume, onOpenStream, onClose,
 }: Props) {
   if (loading) {
     return <section className="hist-view"><div className="hist-empty">正在读取会话…</div></section>;
@@ -56,6 +58,13 @@ export function HistoryView({
         {detail.error && <div className="hist-error">{detail.error}</div>}
 
         <div className="hist-actions">
+          <button
+            className="ghost"
+            title="用当时的运行页布局查看信息流（只读）"
+            onClick={() => onOpenStream(detail)}
+          >
+            回到操作页面
+          </button>
           <button
             className="primary"
             disabled={!canResume}

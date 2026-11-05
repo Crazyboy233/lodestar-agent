@@ -1,4 +1,4 @@
-import type { NodeName, RunMeta, RunState, SessionState, TaskStatus } from './types';
+import type { NodeName, RunMeta, RunState, SessionState, TaskItem, TaskStatus, TaskSummary } from './types';
 
 export const STATE_TEXT: Record<RunState | SessionState, string> = {
   idle: '待开始',
@@ -51,6 +51,17 @@ export function fmtDuration(secs: number): string {
 
 export const isFinished = (s: SessionState): boolean =>
   s === 'done' || s === 'failed' || s === 'aborted' || s === 'error';
+
+/** 任务清单的合计：回看历史时没有后端推的 summary 事件，只能自己数 */
+export function summarizeTasks(tasks: TaskItem[]): TaskSummary {
+  const count = (status: TaskStatus) => tasks.filter((t) => t.status === status).length;
+  return {
+    total: tasks.length,
+    done: tasks.length - count('pending') - count('running'),
+    passed: count('pass'),
+    failed: count('fail'),
+  };
+}
 
 /** 历史列表里的相对时间：今天只给时分，更早给日期 */
 export function timeAgo(tsSeconds: number): string {

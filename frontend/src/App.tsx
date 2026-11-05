@@ -20,6 +20,8 @@ import { NoteList } from './components/NoteList';
 import { QuitPanel } from './components/QuitPanel';
 import { ConfigDialog } from './components/ConfigDialog';
 import { HistoryView } from './components/HistoryView';
+import { ReviewBar } from './components/ReviewBar';
+import { ReviewView } from './components/ReviewView';
 import { pickLaunchLine } from './ui';
 import { withViewTransition } from './viewTransition';
 
@@ -41,11 +43,16 @@ export default function App() {
   );
 
   const { applySnapshot, adopt, requestStop } = run;
-  const { refresh, load, clearDetail, remove: removeHistory } = history;
+  const {
+    refresh, load, clearDetail, remove: removeHistory,
+    stream: recordStream, streamLoading, streamError, streamNote, loadStream,
+  } = history;
   const { runStarted, showWelcome, focusRun, openThread, closeThread } = ui;
+  const { openReview, closeReview } = ui;
   const prepareResumeUi = ui.prepareResume;
 
-  // 初次加载：GET /state 铺底（session / status / meta / 产出目录）
+  // 初次加载：GET /state 铺底（session / status / meta / 产出目录）。
+  // 只有还在跑的那一轮会被恢复；上一轮已经结束的话，主区域落在新任务页（见 applySnapshot）。
   useEffect(() => {
     fetchState()
       .then((snap) => {
@@ -53,7 +60,10 @@ export default function App() {
         setMeta(snap.meta);
         setWorkdir(snap.workdir || snap.meta?.workdir || '');
       })
-      .catch((err: unknown) => reportClient('初始 /state 失败：' + errText(err)));
+      .catch((err: unknown) => {
+        applySnapshot(null);
+        reportClient('初始 /state 失败：' + errText(err));
+      });
   }, [applySnapshot]);
 
   // 运行状态的迁移只在这里收口：开跑就清掉临时视图状态，结束就刷新左侧历史。
@@ -67,10 +77,10 @@ export default function App() {
     if (next !== 'idle') void refresh();
   }, [run.session.state, runStarted, refresh]);
 
-  // data-view 决定主区域的布局模式（launch 居中 flex / run 两列 grid）。
-  // 必须用 layout effect：开跑和新建任务都包在视图过渡里，浏览器拍「新快照」是在
-  // flushSync 返回之前完成的；普通 effect 跑在那之后，快照会拍到旧的布局模式，
-  // 于是动画按旧结构演、结束时再跳一下。
+  // data-view 决定主区域的布局模式（launch 居中 flex / run 与 review 两列 grid /
+  // history 单列）。必须用 layout effect：开跑和新建任务都包在视图过渡里，浏览器拍
+  // 「新快照」是在 flushSync 返回之前完成的；普通 effect 跑在那之后，快照会拍到旧的
+  // 布局模式，于是动画按旧结构演、结束时再跳一下。
   useLayoutEffect(() => {
     document.body.dataset.view = ui.screen;
   }, [ui.screen]);
@@ -154,6 +164,12 @@ export default function App() {
     clearDetail();
   }, [prepareResumeUi, clearDetail]);
 
+  // 历史记录 → 当时的操作页面：主区域换成信息流，布局跟运行页一样，只是只读
+  const openRecordStream = useCallback((item: HistoryDetail) => {
+    openReview();
+    void loadStream(item.thread);
+  }, [openReview, loadStream]);
+
   const useAsNew = useCallback((item: HistoryDetail) => {
     withViewTransition(() => flushSync(() => {
       setPreset({ goal: item.goal, workdir: item.workdir, n: Date.now() });
@@ -232,17 +248,38 @@ export default function App() {
           {ui.screen === 'run' && (
             <Workbar status={run.status} sessionState={run.session.state} />
           )}
+          {ui.screen === 'review' && (
+            <ReviewBar
+              detail={history.detail}
+              onBack={closeReview}
+              onClose={closeHistory}
+            />
+          )}
           <main>
-            {ui.screen === 'history' ? (
+            {ui.screen === 'history' && (
               <HistoryView
                 detail={history.detail}
                 loading={history.detailLoading}
                 error={history.detailError}
                 running={run.session.state === 'running'}
                 onResume={prepareResume}
+                onOpenStream={openRecordStream}
                 onClose={closeHistory}
               />
-            ) : (
+            )}
+
+            {/* 回看历史记录：运行页的布局，但只读、不接命令 */}
+            {ui.screen === 'review' && (
+              <ReviewView
+                detail={history.detail}
+                events={recordStream}
+                loading={streamLoading}
+                error={streamError}
+                note={streamNote}
+              />
+            )}
+
+            {(ui.screen === 'launch' || ui.screen === 'run') && (
               <>
                 {ui.screen === 'launch' ? (
                   // 新任务 = 清屏：只留一句开场白，下面是输入卡

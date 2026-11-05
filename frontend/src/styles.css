@@ -135,6 +135,29 @@
     .workbar .wmodel { display: none; }
   }
 
+  /* ── 回看条：历史记录的操作页面不接命令，只说明这是只读回看 ── */
+  .reviewbar {
+    display: flex; align-items: center; gap: 12px; flex: 0 0 auto;
+    height: 34px; padding: 0 18px; overflow: hidden;
+    background: var(--panel-2); border-bottom: 1px solid var(--border);
+    font-family: var(--mono); font-size: 11.5px; color: var(--muted); white-space: nowrap;
+  }
+  .reviewbar .rv-tag {
+    flex: 0 0 auto; padding: 1px 8px; border-radius: 999px;
+    font-family: var(--sans); font-size: 10.5px; font-weight: 650; letter-spacing: .04em;
+    color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .reviewbar .rv-thread { flex: 0 0 auto; color: var(--faint); }
+  .reviewbar .rv-note {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    font-family: var(--sans); font-size: 11.5px; color: var(--faint);
+  }
+  .reviewbar .ghost { flex: 0 0 auto; }
+  @media (max-width: 860px) {
+    .reviewbar .rv-note, .reviewbar .rv-thread { display: none; }
+  }
+
   /* ── 新任务 / 运行中：上方过程区，下方独立的圆角输入卡 ── */
   /* 主区域按 screen 条件渲染（history 只挂 HistoryView，launch 不挂 aside） */
   /* 清屏页：欢迎语在上、输入卡在下，两块作为一个整体垂直居中
@@ -203,6 +226,8 @@
   }
   .hist-actions { display: flex; align-items: center; gap: 9px; margin: 16px 0 4px; flex-wrap: wrap; }
   .hist-actions .primary { margin: 0; padding: 7px 16px; }
+  /* 次要动作（回看）跟主按钮同高，别缩成一个小方块 */
+  .hist-actions .ghost { padding: 7px 14px; font-size: 12px; }
   .hist-action-tip { font-size: 11px; color: var(--faint); }
   .hist-h2 {
     display: flex; align-items: baseline; gap: 10px;

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -399,3 +400,98 @@ class HistoryStore:
                 } for r in latest.values()]
             return out
         return None
+
+    def log_path(self, thread: str) -> Path | None:
+        """这次运行的日志文件；没记过（老记录 / 回填的会话）就返回 None。"""
+        for item in self.items():
+            if item.get("thread") == thread:
+                raw = str(item.get("log") or "").strip()
+                return Path(raw).expanduser() if raw else None
+        return None
+
+
+# ── 运行日志 → 页面信息流 ─────────────────────────────────
+#
+# `logs/run_*.log` 是终端那套文本，没有 seq 也没有时间戳。回看的历史记录想复用
+# 运行页的事件流样式，就得把它切回「一条一条的事件」：分隔线当段落边界丢掉，
+# `[主 agent] …` 这种行是章节标题（hr），`任务:` / `--- 模型原始输出 ---` 之后的
+# 内容按 task / output 归类，其余是旁白 —— 和实时事件的 role 语义对齐。
+
+_LOG_SECTION = re.compile(r"^\[([^\]]{1,20})\]\s*(.*)$")
+_LOG_NUMBERED = re.compile(r"^\d+\.\s+")
+_LOG_RAW_MARK = "--- 模型原始输出 ---"
+# 行首前缀 → 这一块的 role（要带冒号，避免正文里恰好以「任务」开头的句子误判）
+_LOG_ROLE_START = (
+    ("任务:", "task"),
+    ("验收:", "task"),
+    ("输出:", "output"),
+    ("结论:", "output"),
+    ("错误:", "output"),
+    ("note:", "log"),
+)
+_LOG_KIND_BY_TAG = {"主 agent": "plan", "worker": "worker", "verifier": "verifier"}
+_LOG_STOP_TAGS = {"流程终止", "已中断", "收尾", "续跑失败", "线程冲突"}
+_MAX_EVENTS = 2000
+
+
+def _is_rule(line: str) -> bool:
+    """`======` 分隔线（终端里画的那种）。"""
+    return len(line) >= 10 and set(line) == {"="}
+
+
+def _kind_of(tag: str, current: str) -> str:
+    return _LOG_KIND_BY_TAG.get(tag) or ("stop" if tag in _LOG_STOP_TAGS else current)
+
+
+def parse_log(text: str, limit: int = _MAX_EVENTS) -> list[dict]:
+    """把一份运行日志切成页面事件流（字段与 SSE 的 log 事件一致）。
+
+    ts 全是 0：文本日志没有时间轴，页面据此不显示时钟列，而不是编一个假时间。
+    """
+    lines = text.splitlines()
+    head_at = next((i for i, line in enumerate(lines) if _is_rule(line)), len(lines))
+    events: list[dict] = []
+
+    def push(**fields) -> None:
+        events.append({"seq": len(events) + 1, "ts": 0, **fields})
+
+    # 第一个分隔线之前是运行头：目标 / thread / checkpoint / 模型 / worker / 验收
+    head = "\n".join(line.strip() for line in lines[:head_at] if line.strip())
+    if head:
+        push(kind="system", role="log", text=head)
+
+    kind, role = "system", "log"
+    buf: list[str] = []
+
+    def flush() -> None:
+        if buf:
+            push(kind=kind, role=role, text="\n".join(buf))
+            buf.clear()
+
+    for raw in lines[head_at:]:
+        line = raw.strip()
+        if not line or _is_rule(line):
+            flush()
+            continue
+        section = _LOG_SECTION.match(line)
+        if section:
+            flush()
+            tag, rest = section.group(1), section.group(2)
+            kind, role = _kind_of(tag, kind), "log"
+            push(kind=kind, role="log", hr=True, text=rest or tag)
+            continue
+        if line == _LOG_RAW_MARK:
+            flush()
+            role = "output"
+            push(kind=kind, role="log", text="模型原始输出")
+            continue
+        next_role = next((r for p, r in _LOG_ROLE_START if line.startswith(p)), None)
+        if next_role is None and _LOG_NUMBERED.match(line):
+            next_role = "task"
+        if next_role and next_role != role:
+            flush()
+            role = next_role
+        buf.append(line)
+    flush()
+    return events[-limit:] if len(events) > limit else events
+

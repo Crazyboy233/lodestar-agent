@@ -1,5 +1,5 @@
 import type {
-  ConfigView, HistoryDetail, HistoryGroups, Session, StateSnapshot,
+  ConfigView, HistoryDetail, HistoryGroups, HistoryLog, Session, StateSnapshot,
 } from './types';
 
 async function json<T>(res: Response): Promise<T> {
@@ -46,6 +46,22 @@ export interface HistoryDetailResponse {
 export async function fetchHistoryDetail(thread: string): Promise<HistoryDetailResponse> {
   const res = await fetch(`/history/${encodeURIComponent(thread)}`);
   return json<HistoryDetailResponse>(res);
+}
+
+/**
+ * 一次运行的信息流（回看历史记录的操作页面用）。后端把 logs/run_*.log 切成了事件；
+ * 老记录没有日志文件时返回空 events + note，不算错误。
+ */
+export async function fetchHistoryLog(thread: string): Promise<HistoryLog> {
+  try {
+    const res = await fetch(`/history/${encodeURIComponent(thread)}/log`);
+    return await json<HistoryLog>(res);
+  } catch (err) {
+    return {
+      ok: false, events: [],
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 /**

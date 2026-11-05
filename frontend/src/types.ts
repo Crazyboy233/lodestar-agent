@@ -58,6 +58,17 @@ export interface HistoryDetail extends HistoryItem {
   resumable?: boolean;
 }
 
+/**
+ * 历史记录的信息流：后端把当时那份运行日志切成了事件。
+ * ts 恒为 0（文本日志没有时间轴），页面据此不画时钟列。
+ */
+export interface HistoryLog {
+  ok: boolean;
+  events: LogEvent[];
+  error?: string;
+  note?: string;
+}
+
 export type RunState = 'starting' | 'running' | 'busy' | 'draining' | 'done' | 'aborted' | 'failed';
 export type NodeName = 'plan' | 'worker' | 'verifier' | 'synth';
 
@@ -148,6 +159,8 @@ export interface StateSnapshot extends Status {
   running: boolean;
   stop_requested: boolean;
   stop_reason: string;
+  /** 事件总线的最新 seq；页面用它决定 SSE 从哪开始订阅（0 = 把 backlog 全量重放） */
+  seq: number;
 }
 
 export type ServerEvent =

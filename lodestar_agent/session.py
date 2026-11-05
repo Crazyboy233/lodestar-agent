@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import secrets
 import sqlite3
 import sys
 import textwrap
@@ -29,6 +30,17 @@ from .history import HistoryStore
 from .worker import terminate_all_cli
 
 _DISPLAY_LIMIT = 1200
+
+
+def new_thread_id() -> str:
+    """默认 thread 名：`run_<时间戳>_<6 位随机>`。
+
+    时间戳只到秒，并发起两个会撞成同一个 thread（checkpoint 主键冲突，
+    第二个直接被「线程冲突」挡回来）。补随机位把它变成不撞：3 字节 = 1677 万
+    种取值，同一秒内并发撞上的概率可以忽略。
+    不用 goal 的 hash：同一目标重跑会算出同一个 id，反而必撞。
+    """
+    return f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}_{secrets.token_hex(3)}"
 
 
 @dataclass(frozen=True)
@@ -536,7 +548,7 @@ class Runner:
             if req.verifier_model is not None:
                 self.cfg.verifier.model = req.verifier_model.strip()
             self.cfg.worker.workdir = self._resolve_workdir(req.workdir)
-            tid = req.thread or f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}"
+            tid = req.thread or new_thread_id()
             self.control.reset()
             # 开跑前的引导必须在这里补投：reset 刚把信箱清空，
             # 而线程一旦启动就可能立刻进入第一个节点去取。

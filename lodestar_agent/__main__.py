@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import argparse
-import datetime
 import signal
 import sys
 import threading
@@ -22,7 +21,7 @@ from pathlib import Path
 
 from .config import ConfigError, load_config
 from .control import Control
-from .session import Runner, StartRequest, run_session
+from .session import Runner, StartRequest, new_thread_id, run_session
 from .server import ConsoleServer
 from .worker import check_cli
 
@@ -148,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # ── 纯命令行：跑完就退，不开页面 ──
     if not use_web:
-        thread_id = args.thread_id or f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}"
+        thread_id = args.thread_id or new_thread_id()
         code = run_session(
             cfg, goal, thread_id,
             control=control, con=runner.con, resume=args.resume, dry_run=args.dry_run,

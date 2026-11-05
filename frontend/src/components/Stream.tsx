@@ -83,11 +83,16 @@ function Body({
 
 interface Props {
   events: LogEvent[];
+  /** 面板标题：实时是「事件流」，回看历史是「信息流」 */
+  title?: string;
+  /** 只读回看：不给「清屏」（历史记录清了也没处恢复） */
+  readOnly?: boolean;
 }
 
-export function Stream({ events }: Props) {
+export function Stream({ events, title = '事件流', readOnly = false }: Props) {
   const boxRef = useRef<HTMLDivElement>(null);
-  const [stuck, setStuck] = useState(true);
+  // 实时视图永远跟着尾部走；回看是「从头读一遍」，所以不抢着滚到底，右下角给「回到底部」
+  const [stuck, setStuck] = useState(!readOnly);
   const [clearedAt, setClearedAt] = useState(0);
   const [expanded, setExpanded] = useState<Set<number>>(() => new Set());
 
@@ -119,15 +124,17 @@ export function Stream({ events }: Props) {
   return (
     <section className="stream-wrap">
       <div className="stream-head">
-        <span>事件流</span>
+        <span>{title}</span>
         <span className="count">{visible.length} 条</span>
         <span className="spacer" />
-        <button
-          className="ghost"
-          onClick={() => setClearedAt(events.length ? events[events.length - 1].seq : 0)}
-        >
-          清屏
-        </button>
+        {!readOnly && (
+          <button
+            className="ghost"
+            onClick={() => setClearedAt(events.length ? events[events.length - 1].seq : 0)}
+          >
+            清屏
+          </button>
+        )}
       </div>
 
       <div id="stream" ref={boxRef} onScroll={onScroll}>
@@ -149,7 +156,7 @@ export function Stream({ events }: Props) {
               data-role={role}
               key={e.seq}
             >
-              <span className="ts">{clock(e.ts)}</span>
+              <span className="ts">{e.ts ? clock(e.ts) : ''}</span>
               <span className="tag">{TAG[e.kind] ?? e.kind}</span>
               <span className="role" data-role={role}>{ROLE_TEXT[role]}</span>
               <Body text={e.text} open={open} onToggle={() => toggle(e.seq)} />
